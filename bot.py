@@ -4,7 +4,7 @@ import logging
 import tempfile
 import re
 import unicodedata
-from datetime import datetime
+from datetime import datetime, date
 from zoneinfo import ZoneInfo
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes, JobQueue
@@ -71,6 +71,56 @@ def parse_currency_value(value) -> float:
 def format_eur(value: float) -> str:
     return f"€ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
+def parse_sheet_date(value) -> date | None:
+    if isinstance(value, datetime):
+        return value.date()
+
+    if isinstance(value, date):
+        return value
+
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+
+    # Google Sheets can display dates in multiple formats depending on locale.
+    formats = [
+        "%d/%m/%Y",
+        "%d/%m/%y",
+        "%Y-%m-%d",
+        "%d-%m-%Y",
+        "%d-%m-%y",
+    ]
+
+    for fmt in formats:
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except ValueError:
+            continue
+
+    return None
+
+def current_month_bounds() -> tuple[date, date]:
+    now = datetime.now(AMSTERDAM_TZ).date()
+    start = date(now.year, now.month, 1)
+
+    if now.month == 12:
+        end = date(now.year + 1, 1, 1)
+    else:
+        end = date(now.year, now.month + 1, 1)
+
+    return start, end
+
+def is_current_month(value) -> bool:
+    parsed = parse_sheet_date(value)
+    if parsed is None:
+        return False
+
+    start, end = current_month_bounds()
+    return start <= parsed < end
+
+def current_month_label() -> str:
+    return datetime.now(AMSTERDAM_TZ).strftime("%m/%Y")
+
 # ─── Category list intent ───────────────────────────────────────────────────
 def is_category_list_request(text: str) -> bool:
     normalized = normalize_text(text)
@@ -95,7 +145,32 @@ def extract_category_from_text(text: str) -> str | None:
 
     return None
 
-def get_expenses_by_category(category: str) -> list[dict]:
+def get_monthly_spend_by_category() -> dict[str, float]:
+    sh = gc.open_by_key(SPREADSHEET_ID)
+    ws = sh.worksheet("Lançamentos")
+    rows = ws.get_all_values()
+
+    totals = {category: 0.0 for category in CATEGORIES}
+
+    for row in rows[2:]:
+        if len(row) < 6:
+            continue
+
+        row_date = row[0] if len(row) > 0 else ""
+        if not is_current_month(row_date):
+            continue
+
+        row_category = row[3].strip() if len(row) > 3 else ""
+        canonical_category = extract_category_from_text(row_category) or row_category
+
+        if canonical_category not in totals:
+            totals[canonical_category] = 0.0
+
+        totals[canonical_category] += parse_currency_value(row[5] if len(row) > 5 else "")
+
+    return totals
+
+def get_expenses_by_category(category: str, current_month_only: bool = True) -> list[dict]:
     sh = gc.open_by_key(SPREADSHEET_ID)
     ws = sh.worksheet("Lançamentos")
     rows = ws.get_all_values()
@@ -107,6 +182,10 @@ def get_expenses_by_category(category: str) -> list[dict]:
         if len(row) < 4:
             continue
 
+        row_date = row[0].strip() if len(row) > 0 else ""
+        if current_month_only and not is_current_month(row_date):
+            continue
+
         row_category = row[3].strip() if len(row) > 3 else ""
         if normalize_text(row_category) != category_norm:
             continue
@@ -115,7 +194,7 @@ def get_expenses_by_category(category: str) -> list[dict]:
         amount = parse_currency_value(amount_raw)
 
         expenses.append({
-            "data": row[0].strip() if len(row) > 0 else "",
+            "data": row_date,
             "quem_pagou": row[2].strip() if len(row) > 2 else "",
             "categoria": row_category,
             "descricao": row[4].strip() if len(row) > 4 else "",
@@ -130,13 +209,14 @@ def build_category_expenses_reply(category: str, expenses: list[dict]) -> str:
     if not expenses:
         valid = ", ".join(CATEGORIES)
         return (
-            f"📋 Nenhum gasto encontrado na categoria {category}.\n\n"
+            f"📋 Nenhum gasto encontrado na categoria {category} no mês atual ({current_month_label()}).\n\n"
             f"Categorias válidas: {valid}"
         )
 
     total = sum(item["valor"] for item in expenses)
     lines = [
         f"📋 Gastos da categoria: {category}",
+        f"Mês: {current_month_label()}",
         f"Registros: {len(expenses)}",
         f"Total: {format_eur(total)}",
         "",
@@ -189,7 +269,7 @@ async def transcribe_audio(file_path: str) -> str:
 
 # ─── Parse expense ───────────────────────────────────────────────────────────
 def parse_expense(text: str, sender: str) -> dict:
-    today = datetime.now(AMSTERDAM_TZ).strftime("%d/%m/%y")
+    today = datetime.now(AMSTERDAM_TZ).strftime("%d/%m/%Y")
     week_num = datetime.now(AMSTERDAM_TZ).isocalendar()[1]
     cats = ", ".join(CATEGORIES)
 
@@ -207,7 +287,7 @@ Hoje: {today} | Semana ISO: {week_num}
 Extraia e responda APENAS com JSON válido (sem markdown, sem explicação):
 {{
   "is_summary_request": false,
-  "data": "DD/MM/AA",
+  "data": "DD/MM/YYYY",
   "semana": <número inteiro da semana ISO>,
   "quem_pagou": "<Renata ou Rafa>",
   "categoria": "<categoria>",
@@ -291,6 +371,7 @@ def get_category_insights() -> list[dict]:
     sh = gc.open_by_key(SPREADSHEET_ID)
     ws = sh.worksheet("Por Categoria")
     data = ws.get_all_values()
+    monthly_spend = get_monthly_spend_by_category()
 
     insights = []
     for row in data[2:]:
@@ -298,12 +379,10 @@ def get_category_insights() -> list[dict]:
             continue
         try:
             categoria = row[0].strip()
-            meta  = parse_currency_value(row[1]) if len(row) > 1 else 0.0
-            gasto = parse_currency_value(row[2]) if len(row) > 2 else 0.0
-            saldo = parse_currency_value(row[3]) if len(row) > 3 else 0.0
-            pct_raw = row[4].strip() if len(row) > 4 else "0"
-            pct_raw = pct_raw.replace("%", "").replace(",", ".").strip()
-            pct = float(pct_raw) if pct_raw and pct_raw not in ["#DIV/0!", ""] else 0.0
+            meta = parse_currency_value(row[1]) if len(row) > 1 else 0.0
+            gasto = monthly_spend.get(categoria, 0.0)
+            saldo = meta - gasto
+            pct = (gasto / meta * 100) if meta > 0 else 0.0
 
             insights.append({"categoria": categoria, "meta": meta, "gasto": gasto, "saldo": saldo, "pct": pct})
         except Exception as e:
@@ -313,7 +392,6 @@ def get_category_insights() -> list[dict]:
 
 # ─── Build confirmation message (category only) ──────────────────────────────
 def build_confirmation(expense: dict, insights: list[dict]) -> str:
-    month_name = datetime.now(AMSTERDAM_TZ).strftime("%B").capitalize()
     this_cat = next((i for i in insights if i["categoria"] == expense["categoria"]), None)
 
     lines = []
@@ -326,9 +404,9 @@ def build_confirmation(expense: dict, insights: list[dict]) -> str:
 
     lines.append("")
     if this_cat and this_cat["meta"] > 0:
-        lines.append(f"📊 *{expense['categoria']} — {month_name}:*")
+        lines.append(f"📊 *{expense['categoria']} — mês {current_month_label()}:*")
         lines.append(f"`{progress_bar(this_cat['pct'])}`")
-        lines.append(f"Gasto €{this_cat['gasto']:.2f}  /  Meta €{this_cat['meta']:.2f}  |  Saldo €{this_cat['saldo']:.2f}")
+        lines.append(f"Gasto {format_eur(this_cat['gasto'])}  /  Meta {format_eur(this_cat['meta'])}  |  Saldo {format_eur(this_cat['saldo'])}")
 
         if this_cat['pct'] >= 100:
             lines.append(f"\n🔴 *Atenção! Meta de {expense['categoria']} estourada!*")
@@ -339,9 +417,8 @@ def build_confirmation(expense: dict, insights: list[dict]) -> str:
 
 # ─── Build full summary ──────────────────────────────────────────────────────
 def build_full_summary(insights: list[dict], title: str = None) -> str:
-    month_name = datetime.now(AMSTERDAM_TZ).strftime("%B").capitalize()
     if not title:
-        title = f"📊 *Resumo Mensal — {month_name}*"
+        title = f"📊 *Resumo Mensal — {current_month_label()}*"
 
     lines = [title, ""]
     total_gasto = 0
@@ -352,13 +429,13 @@ def build_full_summary(insights: list[dict], title: str = None) -> str:
     for cat in sorted_cats:
         lines.append(f"*{cat['categoria']}*")
         lines.append(f"`{progress_bar(cat['pct'])}`")
-        lines.append(f"€{cat['gasto']:.2f} / €{cat['meta']:.2f}  |  Saldo €{cat['saldo']:.2f}")
+        lines.append(f"{format_eur(cat['gasto'])} / {format_eur(cat['meta'])}  |  Saldo {format_eur(cat['saldo'])}")
         lines.append("")
         total_gasto += cat["gasto"]
         total_meta += cat["meta"]
 
     total_pct = (total_gasto / total_meta * 100) if total_meta > 0 else 0
-    lines.append(f"💰 *TOTAL: €{total_gasto:.2f} / €{total_meta:.2f}*")
+    lines.append(f"💰 *TOTAL: {format_eur(total_gasto)} / {format_eur(total_meta)}*")
     lines.append(f"`{progress_bar(total_pct)}`")
 
     over    = [i for i in sorted_cats if i["pct"] >= 100]
@@ -447,7 +524,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Category list request via text
     if is_category_list_request(text):
-        await update.message.reply_text("📋 Buscando gastos da categoria...")
+        await update.message.reply_text("📋 Buscando gastos da categoria no mês atual...")
         try:
             category = extract_category_from_text(text)
             if not category:
@@ -468,7 +545,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Summary request via text
     summary_keywords = ["resumo", "summary", "relatório", "relatorio", "como estamos"]
     if any(kw in text.lower() for kw in summary_keywords):
-        await update.message.reply_text("📊 Carregando resumo...")
+        await update.message.reply_text("📊 Carregando resumo do mês atual...")
         insights = get_category_insights()
         reply = build_full_summary(insights)
         await update.message.reply_text(reply, parse_mode="Markdown")
@@ -517,9 +594,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 *Bot de Gastos — Rafa & Renata* ativo!\n\n"
         "🎙️ Mande um *áudio* com o gasto:\n"
         "_Gastei 32 euros no supermercado, débito_\n\n"
-        "📊 Para ver o resumo completo, mande:\n"
+        "📊 Para ver o resumo do mês atual, mande:\n"
         "_resumo_ ou _como estamos?_\n\n"
-        "📋 Para listar uma categoria, mande:\n"
+        "📋 Para listar uma categoria no mês atual, mande:\n"
         "_mostre os gastos da categoria Alimentação_\n\n"
         "🗓️ Toda segunda-feira às 8h recebem o resumo automático!\n\n"
         "Vamos economizar! 💪",
@@ -528,7 +605,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── /resumo ─────────────────────────────────────────────────────────────────
 async def resumo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📊 Carregando resumo...")
+    await update.message.reply_text("📊 Carregando resumo do mês atual...")
     try:
         insights = get_category_insights()
         reply = build_full_summary(insights)
