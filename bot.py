@@ -143,22 +143,23 @@ def insert_lancamento(expense: dict) -> int:
         if target_row is None:
             target_row = len(all_vals) + 1
 
-    valor_float = float(expense["valor"])
-    valor_str = f" €  {valor_float:,.2f} ".replace(",", "X").replace(".", ",").replace("X", ".")
+    # Store the amount as a real number, not as a formatted text string.
+    # Currency formatting must be handled by the Google Sheets column format.
+    valor_float = round(float(expense["valor"]), 2)
 
     row_data = [
         expense["data"], expense["semana"], expense["quem_pagou"],
         expense["categoria"], expense.get("descricao", ""),
-        valor_str, expense["pago_com"], expense.get("observacao", "")
+        valor_float, expense["pago_com"], expense.get("observacao", "")
     ]
 
     row_vals = all_vals[target_row - 1] if target_row <= len(all_vals) else []
     date_existing = row_vals[0].strip() if row_vals else ""
 
     if date_existing:
-        ws.update(f"A{target_row}:H{target_row}", [row_data])
+        ws.update(f"A{target_row}:H{target_row}", [row_data], value_input_option="USER_ENTERED")
     else:
-        ws.insert_row(row_data, target_row)
+        ws.insert_row(row_data, target_row, value_input_option="USER_ENTERED")
 
     logger.info(f"Row {target_row}: {row_data}")
     return target_row
@@ -367,7 +368,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "_\"Gastei 32 euros no supermercado, débito\"_\n\n"
         "📊 Para ver o resumo completo, mande:\n"
         "_\"resumo\"_ ou _\"como estamos?\"_\n\n"
-        "🗓️ Todo segundo-feira às 8h recebem o resumo automático!\n\n"
+        "🗓️ Toda segunda-feira às 8h recebem o resumo automático!\n\n"
         "Vamos economizar! 💪",
         parse_mode="Markdown"
     )
