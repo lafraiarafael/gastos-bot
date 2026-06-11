@@ -7,7 +7,7 @@ import unicodedata
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
 from telegram import Update
-from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes, JobQueue
+from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 from openai import OpenAI
 import gspread
 from google.oauth2.service_account import Credentials
@@ -40,12 +40,33 @@ CATEGORIES = [
     "Farmácia", "Impostos", "Outros"
 ]
 
+MONTH_ALIASES = {
+    "janeiro": 1, "jan": 1,
+    "fevereiro": 2, "fev": 2,
+    "marco": 3, "mar": 3,
+    "abril": 4, "abr": 4,
+    "maio": 5, "mai": 5,
+    "junho": 6, "jun": 6,
+    "julho": 7, "jul": 7,
+    "agosto": 8, "ago": 8,
+    "setembro": 9, "set": 9,
+    "outubro": 10, "out": 10,
+    "novembro": 11, "nov": 11,
+    "dezembro": 12, "dez": 12,
+}
+
+MONTH_NAMES = {
+    1: "janeiro", 2: "fevereiro", 3: "março", 4: "abril",
+    5: "maio", 6: "junho", 7: "julho", 8: "agosto",
+    9: "setembro", 10: "outubro", 11: "novembro", 12: "dezembro",
+}
+
 # ─── Text helpers ───────────────────────────────────────────────────────────
 def normalize_text(value: str) -> str:
     value = unicodedata.normalize("NFKD", value or "")
     value = "".join(ch for ch in value if not unicodedata.combining(ch))
     value = value.lower().strip()
-    value = re.sub(r"[^a-z0-9]+", " ", value)
+    value = re.sub(r"[^a-z0-9/]+", " ", value)
     return re.sub(r"\s+", " ", value).strip()
 
 def parse_currency_value(value) -> float:
@@ -82,7 +103,6 @@ def parse_sheet_date(value) -> date | None:
     if not raw:
         return None
 
-    # Google Sheets can display dates in multiple formats depending on locale.
     formats = [
         "%d/%m/%Y",
         "%d/%m/%y",
@@ -99,29 +119,71 @@ def parse_sheet_date(value) -> date | None:
 
     return None
 
-def current_month_bounds() -> tuple[date, date]:
-    now = datetime.now(AMSTERDAM_TZ).date()
-    start = date(now.year, now.month, 1)
+def month_bounds(year: int, month: int) -> tuple[date, date]:
+    start = date(year, month, 1)
 
-    if now.month == 12:
-        end = date(now.year + 1, 1, 1)
+    if month == 12:
+        end = date(year + 1, 1, 1)
     else:
-        end = date(now.year, now.month + 1, 1)
+        end = date(year, month + 1, 1)
 
     return start, end
 
-def is_current_month(value) -> bool:
+def current_month_bounds() -> tuple[date, date]:
+    now = datetime.now(AMSTERDAM_TZ).date()
+    return month_bounds(now.year, now.month)
+
+def period_label(start: date) -> str:
+    return f"{MONTH_NAMES[start.month].capitalize()}/{start.year}"
+
+def current_month_label() -> str:
+    start, _ = current_month_bounds()
+    return period_label(start)
+
+def bounds_from_date(value) -> tuple[date, date]:
+    parsed = parse_sheet_date(value) or datetime.now(AMSTERDAM_TZ).date()
+    return month_bounds(parsed.year, parsed.month)
+
+def extract_period_from_text(text: str) -> tuple[date, date]:
+    normalized = normalize_text(text)
+    today = datetime.now(AMSTERDAM_TZ).date()
+
+    if any(phrase in normalized for phrase in ["mes passado", "mes anterior", "ultimo mes"]):
+        if today.month == 1:
+            return month_bounds(today.year - 1, 12)
+        return month_bounds(today.year, today.month - 1)
+
+    numeric_match = re.search(r"\b(0?[1-9]|1[0-2])[/\-](20\d{2}|\d{2})\b", normalized)
+    if numeric_match:
+        month = int(numeric_match.group(1))
+        year = int(numeric_match.group(2))
+        if year < 100:
+            year += 2000
+        return month_bounds(year, month)
+
+    year_match = re.search(r"\b(20\d{2})\b", normalized)
+    explicit_year = int(year_match.group(1)) if year_match else None
+
+    for alias, month in MONTH_ALIASES.items():
+        if re.search(rf"\b{re.escape(alias)}\b", normalized):
+            if explicit_year:
+                year = explicit_year
+            else:
+                # If the month requested is ahead of the current month, assume the previous year.
+                # Example: in January, "resumo de dezembro" usually means last December.
+                year = today.year if month <= today.month else today.year - 1
+            return month_bounds(year, month)
+
+    return current_month_bounds()
+
+def is_in_period(value, start: date, end: date) -> bool:
     parsed = parse_sheet_date(value)
     if parsed is None:
         return False
 
-    start, end = current_month_bounds()
     return start <= parsed < end
 
-def current_month_label() -> str:
-    return datetime.now(AMSTERDAM_TZ).strftime("%m/%Y")
-
-# ─── Category list intent ───────────────────────────────────────────────────
+# ─── Intent helpers ─────────────────────────────────────────────────────────
 def is_category_list_request(text: str) -> bool:
     normalized = normalize_text(text)
 
@@ -136,6 +198,12 @@ def is_category_list_request(text: str) -> bool:
 
     return has_expense_word and has_category_word and has_request_word
 
+def is_summary_request(text: str) -> bool:
+    normalized = normalize_text(text)
+    return any(kw in normalized for kw in [
+        "resumo", "summary", "relatorio", "como estamos", "situacao"
+    ])
+
 def extract_category_from_text(text: str) -> str | None:
     normalized = normalize_text(text)
 
@@ -145,11 +213,14 @@ def extract_category_from_text(text: str) -> str | None:
 
     return None
 
-def get_monthly_spend_by_category() -> dict[str, float]:
+# ─── Google Sheets readers ──────────────────────────────────────────────────
+def get_launch_rows() -> list[list[str]]:
     sh = gc.open_by_key(SPREADSHEET_ID)
     ws = sh.worksheet("Lançamentos")
-    rows = ws.get_all_values()
+    return ws.get_all_values()
 
+def get_monthly_spend_by_category(start: date, end: date) -> dict[str, float]:
+    rows = get_launch_rows()
     totals = {category: 0.0 for category in CATEGORIES}
 
     for row in rows[2:]:
@@ -157,7 +228,7 @@ def get_monthly_spend_by_category() -> dict[str, float]:
             continue
 
         row_date = row[0] if len(row) > 0 else ""
-        if not is_current_month(row_date):
+        if not is_in_period(row_date, start, end):
             continue
 
         row_category = row[3].strip() if len(row) > 3 else ""
@@ -170,11 +241,8 @@ def get_monthly_spend_by_category() -> dict[str, float]:
 
     return totals
 
-def get_expenses_by_category(category: str, current_month_only: bool = True) -> list[dict]:
-    sh = gc.open_by_key(SPREADSHEET_ID)
-    ws = sh.worksheet("Lançamentos")
-    rows = ws.get_all_values()
-
+def get_expenses_by_category(category: str, start: date, end: date) -> list[dict]:
+    rows = get_launch_rows()
     category_norm = normalize_text(category)
     expenses = []
 
@@ -183,7 +251,7 @@ def get_expenses_by_category(category: str, current_month_only: bool = True) -> 
             continue
 
         row_date = row[0].strip() if len(row) > 0 else ""
-        if current_month_only and not is_current_month(row_date):
+        if not is_in_period(row_date, start, end):
             continue
 
         row_category = row[3].strip() if len(row) > 3 else ""
@@ -205,18 +273,20 @@ def get_expenses_by_category(category: str, current_month_only: bool = True) -> 
 
     return expenses
 
-def build_category_expenses_reply(category: str, expenses: list[dict]) -> str:
+def build_category_expenses_reply(category: str, expenses: list[dict], start: date) -> str:
+    label = period_label(start)
+
     if not expenses:
         valid = ", ".join(CATEGORIES)
         return (
-            f"📋 Nenhum gasto encontrado na categoria {category} no mês atual ({current_month_label()}).\n\n"
+            f"📋 Nenhum gasto encontrado na categoria {category} em {label}.\n\n"
             f"Categorias válidas: {valid}"
         )
 
     total = sum(item["valor"] for item in expenses)
     lines = [
         f"📋 Gastos da categoria: {category}",
-        f"Mês: {current_month_label()}",
+        f"Mês: {label}",
         f"Registros: {len(expenses)}",
         f"Total: {format_eur(total)}",
         "",
@@ -273,9 +343,7 @@ def parse_expense(text: str, sender: str) -> dict:
     week_num = datetime.now(AMSTERDAM_TZ).isocalendar()[1]
     cats = ", ".join(CATEGORIES)
 
-    # Check if user is requesting a summary
-    summary_keywords = ["resumo", "summary", "relatório", "relatorio", "como estamos", "situação", "situacao"]
-    if any(kw in text.lower() for kw in summary_keywords):
+    if is_summary_request(text):
         return {"is_summary_request": True}
 
     prompt = f"""Você é um assistente de controle financeiro de casal que mora na Holanda.
@@ -367,11 +435,11 @@ def insert_lancamento(expense: dict) -> int:
     return target_row
 
 # ─── Get category insights ───────────────────────────────────────────────────
-def get_category_insights() -> list[dict]:
+def get_category_insights(start: date, end: date) -> list[dict]:
     sh = gc.open_by_key(SPREADSHEET_ID)
     ws = sh.worksheet("Por Categoria")
     data = ws.get_all_values()
-    monthly_spend = get_monthly_spend_by_category()
+    monthly_spend = get_monthly_spend_by_category(start, end)
 
     insights = []
     for row in data[2:]:
@@ -391,7 +459,7 @@ def get_category_insights() -> list[dict]:
     return insights
 
 # ─── Build confirmation message (category only) ──────────────────────────────
-def build_confirmation(expense: dict, insights: list[dict]) -> str:
+def build_confirmation(expense: dict, insights: list[dict], start: date) -> str:
     this_cat = next((i for i in insights if i["categoria"] == expense["categoria"]), None)
 
     lines = []
@@ -404,7 +472,7 @@ def build_confirmation(expense: dict, insights: list[dict]) -> str:
 
     lines.append("")
     if this_cat and this_cat["meta"] > 0:
-        lines.append(f"📊 *{expense['categoria']} — mês {current_month_label()}:*")
+        lines.append(f"📊 *{expense['categoria']} — {period_label(start)}:*")
         lines.append(f"`{progress_bar(this_cat['pct'])}`")
         lines.append(f"Gasto {format_eur(this_cat['gasto'])}  /  Meta {format_eur(this_cat['meta'])}  |  Saldo {format_eur(this_cat['saldo'])}")
 
@@ -416,9 +484,9 @@ def build_confirmation(expense: dict, insights: list[dict]) -> str:
     return "\n".join(lines)
 
 # ─── Build full summary ──────────────────────────────────────────────────────
-def build_full_summary(insights: list[dict], title: str = None) -> str:
+def build_full_summary(insights: list[dict], start: date, title: str = None) -> str:
     if not title:
-        title = f"📊 *Resumo Mensal — {current_month_label()}*"
+        title = f"📊 *Resumo Mensal — {period_label(start)}*"
 
     lines = [title, ""]
     total_gasto = 0
@@ -452,14 +520,36 @@ def build_full_summary(insights: list[dict], title: str = None) -> str:
 
     return "\n".join(lines)
 
+async def reply_summary(update: Update, text: str):
+    start, end = extract_period_from_text(text)
+    await update.message.reply_text(f"📊 Carregando resumo de {period_label(start)}...")
+    insights = get_category_insights(start, end)
+    reply = build_full_summary(insights, start)
+    await update.message.reply_text(reply, parse_mode="Markdown")
+
+async def reply_category_list(update: Update, text: str):
+    start, end = extract_period_from_text(text)
+    category = extract_category_from_text(text)
+    if not category:
+        await update.message.reply_text(
+            "Não encontrei a categoria no pedido. Categorias válidas: " + ", ".join(CATEGORIES)
+        )
+        return
+
+    await update.message.reply_text(f"📋 Buscando gastos de {category} em {period_label(start)}...")
+    expenses = get_expenses_by_category(category, start, end)
+    reply = build_category_expenses_reply(category, expenses, start)
+    await update.message.reply_text(reply)
+
 # ─── Weekly summary job ──────────────────────────────────────────────────────
 async def send_weekly_summary(context) -> None:
     chat_id = context.job.data
     try:
-        insights = get_category_insights()
+        start, end = current_month_bounds()
+        insights = get_category_insights(start, end)
         now = datetime.now(AMSTERDAM_TZ)
         title = f"📊 *Resumo Semanal — {now.strftime('%d/%m/%Y')}*"
-        msg = build_full_summary(insights, title)
+        msg = build_full_summary(insights, start, title)
         await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
         logger.info(f"Weekly summary sent to {chat_id}")
     except Exception as e:
@@ -483,31 +573,24 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.unlink(tmp_path)
 
         if is_category_list_request(transcript):
-            category = extract_category_from_text(transcript)
-            if not category:
-                await update.message.reply_text(
-                    "Não encontrei a categoria no pedido. Categorias válidas: " + ", ".join(CATEGORIES)
-                )
-                return
+            await reply_category_list(update, transcript)
+            return
 
-            expenses = get_expenses_by_category(category)
-            reply = build_category_expenses_reply(category, expenses)
-            await update.message.reply_text(reply)
+        if is_summary_request(transcript):
+            await reply_summary(update, transcript)
             return
 
         parsed = parse_expense(transcript, sender)
 
-        # Summary request via audio
         if parsed.get("is_summary_request"):
-            insights = get_category_insights()
-            reply = build_full_summary(insights)
-            await update.message.reply_text(reply, parse_mode="Markdown")
+            await reply_summary(update, transcript)
             return
 
         expense = parsed
         insert_lancamento(expense)
-        insights = get_category_insights()
-        reply = build_confirmation(expense, insights)
+        start, end = bounds_from_date(expense.get("data"))
+        insights = get_category_insights(start, end)
+        reply = build_confirmation(expense, insights, start)
         await update.message.reply_text(reply, parse_mode="Markdown")
 
     except Exception as e:
@@ -522,34 +605,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sender = identify_sender(update)
 
-    # Category list request via text
     if is_category_list_request(text):
-        await update.message.reply_text("📋 Buscando gastos da categoria no mês atual...")
         try:
-            category = extract_category_from_text(text)
-            if not category:
-                await update.message.reply_text(
-                    "Não encontrei a categoria no pedido. Categorias válidas: " + ", ".join(CATEGORIES)
-                )
-                return
-
-            expenses = get_expenses_by_category(category)
-            reply = build_category_expenses_reply(category, expenses)
-            await update.message.reply_text(reply)
+            await reply_category_list(update, text)
             return
         except Exception as e:
             logger.error(f"Category list error: {e}", exc_info=True)
             await update.message.reply_text(f"❌ Erro: `{e}`", parse_mode="Markdown")
             return
 
-    # Summary request via text
-    summary_keywords = ["resumo", "summary", "relatório", "relatorio", "como estamos"]
-    if any(kw in text.lower() for kw in summary_keywords):
-        await update.message.reply_text("📊 Carregando resumo do mês atual...")
-        insights = get_category_insights()
-        reply = build_full_summary(insights)
-        await update.message.reply_text(reply, parse_mode="Markdown")
-        return
+    if is_summary_request(text):
+        try:
+            await reply_summary(update, text)
+            return
+        except Exception as e:
+            logger.error(f"Summary error: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Erro: `{e}`", parse_mode="Markdown")
+            return
 
     if not re.search(r'\d', text):
         return
@@ -559,14 +631,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         expense = parse_expense(text, sender)
         if expense.get("is_summary_request"):
-            insights = get_category_insights()
-            reply = build_full_summary(insights)
-            await update.message.reply_text(reply, parse_mode="Markdown")
+            await reply_summary(update, text)
             return
 
         insert_lancamento(expense)
-        insights = get_category_insights()
-        reply = build_confirmation(expense, insights)
+        start, end = bounds_from_date(expense.get("data"))
+        insights = get_category_insights(start, end)
+        reply = build_confirmation(expense, insights, start)
         await update.message.reply_text(reply, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Text error: {e}", exc_info=True)
@@ -594,22 +665,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 *Bot de Gastos — Rafa & Renata* ativo!\n\n"
         "🎙️ Mande um *áudio* com o gasto:\n"
         "_Gastei 32 euros no supermercado, débito_\n\n"
-        "📊 Para ver o resumo do mês atual, mande:\n"
-        "_resumo_ ou _como estamos?_\n\n"
-        "📋 Para listar uma categoria no mês atual, mande:\n"
-        "_mostre os gastos da categoria Alimentação_\n\n"
-        "🗓️ Toda segunda-feira às 8h recebem o resumo automático!\n\n"
+        "📊 Para ver resumo por mês:\n"
+        "_resumo_\n"
+        "_resumo de junho_\n"
+        "_resumo do mês passado_\n\n"
+        "📋 Para listar uma categoria por mês:\n"
+        "_mostre os gastos da categoria Alimentação_\n"
+        "_mostre os gastos da categoria Alimentação em junho_\n\n"
+        "🗓️ Toda segunda-feira às 8h recebem o resumo automático do mês atual!\n\n"
         "Vamos economizar! 💪",
         parse_mode="Markdown"
     )
 
 # ─── /resumo ─────────────────────────────────────────────────────────────────
 async def resumo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📊 Carregando resumo do mês atual...")
     try:
-        insights = get_category_insights()
-        reply = build_full_summary(insights)
-        await update.message.reply_text(reply, parse_mode="Markdown")
+        query = " ".join(context.args) if context.args else ""
+        await reply_summary(update, query)
     except Exception as e:
         await update.message.reply_text(f"❌ Erro: `{e}`", parse_mode="Markdown")
 
