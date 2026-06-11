@@ -3,6 +3,7 @@ import json
 import logging
 import tempfile
 import re
+import unicodedata
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from telegram import Update
@@ -38,6 +39,127 @@ CATEGORIES = [
     "Saúde", "Lazer", "Educação", "Roupas",
     "Farmácia", "Impostos", "Outros"
 ]
+
+# ─── Text helpers ───────────────────────────────────────────────────────────
+def normalize_text(value: str) -> str:
+    value = unicodedata.normalize("NFKD", value or "")
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    value = value.lower().strip()
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+def parse_currency_value(value) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    s = str(value or "").strip()
+    s = re.sub(r"[R$€'\s]", "", s)
+
+    if not s or s in ["#DIV/0!", "-"]:
+        return 0.0
+
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        s = s.replace(",", ".")
+
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+def format_eur(value: float) -> str:
+    return f"€ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+# ─── Category list intent ───────────────────────────────────────────────────
+def is_category_list_request(text: str) -> bool:
+    normalized = normalize_text(text)
+
+    has_expense_word = any(word in normalized for word in [
+        "gastos", "despesas", "lancamentos", "lancamento"
+    ])
+    has_category_word = "categoria" in normalized
+    has_request_word = any(phrase in normalized for phrase in [
+        "quais foram", "me mostre", "mostre", "mostrar",
+        "listar", "liste", "lista", "ver", "consultar", "consulta"
+    ])
+
+    return has_expense_word and has_category_word and has_request_word
+
+def extract_category_from_text(text: str) -> str | None:
+    normalized = normalize_text(text)
+
+    for category in CATEGORIES:
+        if normalize_text(category) in normalized:
+            return category
+
+    return None
+
+def get_expenses_by_category(category: str) -> list[dict]:
+    sh = gc.open_by_key(SPREADSHEET_ID)
+    ws = sh.worksheet("Lançamentos")
+    rows = ws.get_all_values()
+
+    category_norm = normalize_text(category)
+    expenses = []
+
+    for row in rows[2:]:
+        if len(row) < 4:
+            continue
+
+        row_category = row[3].strip() if len(row) > 3 else ""
+        if normalize_text(row_category) != category_norm:
+            continue
+
+        amount_raw = row[5] if len(row) > 5 else ""
+        amount = parse_currency_value(amount_raw)
+
+        expenses.append({
+            "data": row[0].strip() if len(row) > 0 else "",
+            "quem_pagou": row[2].strip() if len(row) > 2 else "",
+            "categoria": row_category,
+            "descricao": row[4].strip() if len(row) > 4 else "",
+            "valor": amount,
+            "pago_com": row[6].strip() if len(row) > 6 else "",
+            "observacao": row[7].strip() if len(row) > 7 else "",
+        })
+
+    return expenses
+
+def build_category_expenses_reply(category: str, expenses: list[dict]) -> str:
+    if not expenses:
+        valid = ", ".join(CATEGORIES)
+        return (
+            f"📋 Nenhum gasto encontrado na categoria {category}.\n\n"
+            f"Categorias válidas: {valid}"
+        )
+
+    total = sum(item["valor"] for item in expenses)
+    lines = [
+        f"📋 Gastos da categoria: {category}",
+        f"Registros: {len(expenses)}",
+        f"Total: {format_eur(total)}",
+        "",
+    ]
+
+    max_items = 30
+    for item in expenses[:max_items]:
+        # Columns A, C, D, E, F, G, H:
+        # data, quem_pagou, categoria, descricao, valor, pago_com, observacao
+        line = (
+            f"• {item['data']} | {item['quem_pagou']} | {item['categoria']} | "
+            f"{item['descricao']} | {format_eur(item['valor'])} | {item['pago_com']}"
+        )
+        if item["observacao"]:
+            line += f" | {item['observacao']}"
+        lines.append(line)
+
+    remaining = len(expenses) - max_items
+    if remaining > 0:
+        lines.append("")
+        lines.append(f"...mais {remaining} lançamento(s). Refine a busca se quiser ver menos itens.")
+
+    return "\n".join(lines)
 
 # ─── Identify sender ─────────────────────────────────────────────────────────
 def identify_sender(update: Update) -> str:
@@ -175,14 +297,10 @@ def get_category_insights() -> list[dict]:
         if not row or not row[0].strip() or row[0].strip().upper() == "TOTAL":
             continue
         try:
-            def parse_currency(s):
-                s = re.sub(r'[R$€\s]', '', s).replace(".", "").replace(",", ".").strip()
-                return float(s) if s and s not in ["#DIV/0!", "-", ""] else 0.0
-
             categoria = row[0].strip()
-            meta  = parse_currency(row[1]) if len(row) > 1 else 0.0
-            gasto = parse_currency(row[2]) if len(row) > 2 else 0.0
-            saldo = parse_currency(row[3]) if len(row) > 3 else 0.0
+            meta  = parse_currency_value(row[1]) if len(row) > 1 else 0.0
+            gasto = parse_currency_value(row[2]) if len(row) > 2 else 0.0
+            saldo = parse_currency_value(row[3]) if len(row) > 3 else 0.0
             pct_raw = row[4].strip() if len(row) > 4 else "0"
             pct_raw = pct_raw.replace("%", "").replace(",", ".").strip()
             pct = float(pct_raw) if pct_raw and pct_raw not in ["#DIV/0!", ""] else 0.0
@@ -287,6 +405,19 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"Transcript [{sender}]: {transcript}")
         os.unlink(tmp_path)
 
+        if is_category_list_request(transcript):
+            category = extract_category_from_text(transcript)
+            if not category:
+                await update.message.reply_text(
+                    "Não encontrei a categoria no pedido. Categorias válidas: " + ", ".join(CATEGORIES)
+                )
+                return
+
+            expenses = get_expenses_by_category(category)
+            reply = build_category_expenses_reply(category, expenses)
+            await update.message.reply_text(reply)
+            return
+
         parsed = parse_expense(transcript, sender)
 
         # Summary request via audio
@@ -313,6 +444,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     sender = identify_sender(update)
+
+    # Category list request via text
+    if is_category_list_request(text):
+        await update.message.reply_text("📋 Buscando gastos da categoria...")
+        try:
+            category = extract_category_from_text(text)
+            if not category:
+                await update.message.reply_text(
+                    "Não encontrei a categoria no pedido. Categorias válidas: " + ", ".join(CATEGORIES)
+                )
+                return
+
+            expenses = get_expenses_by_category(category)
+            reply = build_category_expenses_reply(category, expenses)
+            await update.message.reply_text(reply)
+            return
+        except Exception as e:
+            logger.error(f"Category list error: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Erro: `{e}`", parse_mode="Markdown")
+            return
 
     # Summary request via text
     summary_keywords = ["resumo", "summary", "relatório", "relatorio", "como estamos"]
@@ -368,6 +519,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "_Gastei 32 euros no supermercado, débito_\n\n"
         "📊 Para ver o resumo completo, mande:\n"
         "_resumo_ ou _como estamos?_\n\n"
+        "📋 Para listar uma categoria, mande:\n"
+        "_mostre os gastos da categoria Alimentação_\n\n"
         "🗓️ Toda segunda-feira às 8h recebem o resumo automático!\n\n"
         "Vamos economizar! 💪",
         parse_mode="Markdown"
