@@ -1,4 +1,4 @@
-python-telegram-bot==21.6
+python-telegram-bot==20.7
 openai==1.30.5
 httpx==0.27.0
 gspread==6.1.2
