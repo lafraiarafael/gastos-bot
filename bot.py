@@ -219,31 +219,32 @@ def build_confirmation(expense: dict, insights: list[dict]) -> str:
 
     return "\n".join(lines)
 
-# ─── Build compact full summary ──────────────────────────────────────────────
+# ─── Build full summary ──────────────────────────────────────────────────────
 def build_full_summary(insights: list[dict], title: str = None) -> str:
     month_name = datetime.now(AMSTERDAM_TZ).strftime("%B").capitalize()
     if not title:
-        title = f"📊 *Resumo — {month_name}*"
+        title = f"📊 *Resumo Mensal — {month_name}*"
 
-    cats = [i for i in insights if i["meta"] > 0]
-    total_gasto = sum(i["gasto"] for i in cats)
-    total_meta = sum(i["meta"] for i in cats)
-    total_saldo = total_meta - total_gasto
-    total_pct = (total_gasto / total_meta * 100) if total_meta > 0 else 0
+    lines = [title, ""]
+    total_gasto = 0
+    total_meta = 0
 
-    top_spent = sorted([i for i in cats if i["gasto"] > 0], key=lambda x: x["gasto"], reverse=True)[:4]
-    over = sorted([i for i in cats if i["pct"] >= 100], key=lambda x: x["pct"], reverse=True)
-    warning = sorted([i for i in cats if 75 <= i["pct"] < 100], key=lambda x: x["pct"], reverse=True)
+    sorted_cats = sorted([i for i in insights if i["meta"] > 0], key=lambda x: x["pct"], reverse=True)
 
-    lines = [title]
-    lines.append(f"💰 *€{total_gasto:.2f} / €{total_meta:.2f}* ({total_pct:.0f}%)")
-    lines.append(f"Saldo: €{total_saldo:.2f}")
-
-    if top_spent:
+    for cat in sorted_cats:
+        lines.append(f"*{cat['categoria']}*")
+        lines.append(f"`{progress_bar(cat['pct'])}`")
+        lines.append(f"€{cat['gasto']:.2f} / €{cat['meta']:.2f}  |  Saldo €{cat['saldo']:.2f}")
         lines.append("")
-        lines.append("*Top gastos:*")
-        for cat in top_spent:
-            lines.append(f"• {cat['categoria']}: €{cat['gasto']:.2f} ({cat['pct']:.0f}%)")
+        total_gasto += cat["gasto"]
+        total_meta += cat["meta"]
+
+    total_pct = (total_gasto / total_meta * 100) if total_meta > 0 else 0
+    lines.append(f"💰 *TOTAL: €{total_gasto:.2f} / €{total_meta:.2f}*")
+    lines.append(f"`{progress_bar(total_pct)}`")
+
+    over    = [i for i in sorted_cats if i["pct"] >= 100]
+    warning = [i for i in sorted_cats if 75 <= i["pct"] < 100]
 
     if over or warning:
         lines.append("")
@@ -252,7 +253,7 @@ def build_full_summary(insights: list[dict], title: str = None) -> str:
         lines.append(f"🔴 Estourou: {names}")
     if warning:
         names = " | ".join([f"*{i['categoria']}*" for i in warning])
-        lines.append(f"🟡 Atenção: {names}")
+        lines.append(f"🟡 Atenção (>75%): {names}")
 
     return "\n".join(lines)
 
@@ -364,9 +365,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Bot de Gastos — Rafa & Renata* ativo!\n\n"
         "🎙️ Mande um *áudio* com o gasto:\n"
-        "_\"Gastei 32 euros no supermercado, débito\"_\n\n"
+        "_Gastei 32 euros no supermercado, débito_\n\n"
         "📊 Para ver o resumo completo, mande:\n"
-        "_\"resumo\"_ ou _\"como estamos?"_\n\n"
+        "_resumo_ ou _como estamos?_\n\n"
         "🗓️ Toda segunda-feira às 8h recebem o resumo automático!\n\n"
         "Vamos economizar! 💪",
         parse_mode="Markdown"
