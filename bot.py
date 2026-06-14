@@ -39,6 +39,8 @@ CATEGORIES = [
     "Saúde", "Lazer", "Educação", "Roupas",
     "Farmácia", "Impostos", "Outros"
 ]
+SAVINGS_CATEGORY = "Poupança"
+VALID_CATEGORIES = CATEGORIES + [SAVINGS_CATEGORY]
 
 MONTH_ALIASES = {
     "janeiro": 1, "jan": 1,
@@ -68,6 +70,9 @@ def normalize_text(value: str) -> str:
     value = value.lower().strip()
     value = re.sub(r"[^a-z0-9/]+", " ", value)
     return re.sub(r"\s+", " ", value).strip()
+
+def is_savings_category(value: str) -> bool:
+    return normalize_text(value) == normalize_text(SAVINGS_CATEGORY)
 
 def parse_currency_value(value) -> float:
     if isinstance(value, (int, float)):
@@ -136,10 +141,6 @@ def current_month_bounds() -> tuple[date, date]:
 def period_label(start: date) -> str:
     return f"{MONTH_NAMES[start.month].capitalize()}/{start.year}"
 
-def current_month_label() -> str:
-    start, _ = current_month_bounds()
-    return period_label(start)
-
 def bounds_from_date(value) -> tuple[date, date]:
     parsed = parse_sheet_date(value) or datetime.now(AMSTERDAM_TZ).date()
     return month_bounds(parsed.year, parsed.month)
@@ -204,10 +205,11 @@ def is_summary_request(text: str) -> bool:
         "resumo", "summary", "relatorio", "como estamos", "situacao"
     ])
 
-def extract_category_from_text(text: str) -> str | None:
+def extract_category_from_text(text: str, include_savings: bool = False) -> str | None:
     normalized = normalize_text(text)
+    categories = VALID_CATEGORIES if include_savings else CATEGORIES
 
-    for category in CATEGORIES:
+    for category in categories:
         if normalize_text(category) in normalized:
             return category
 
@@ -232,6 +234,9 @@ def get_monthly_spend_by_category(start: date, end: date) -> dict[str, float]:
             continue
 
         row_category = row[3].strip() if len(row) > 3 else ""
+        if is_savings_category(row_category):
+            continue
+
         canonical_category = extract_category_from_text(row_category) or row_category
 
         if canonical_category not in totals:
@@ -240,6 +245,19 @@ def get_monthly_spend_by_category(start: date, end: date) -> dict[str, float]:
         totals[canonical_category] += parse_currency_value(row[5] if len(row) > 5 else "")
 
     return totals
+
+def get_savings_total() -> float:
+    rows = get_launch_rows()
+    total = 0.0
+
+    for row in rows[2:]:
+        row_category = row[3].strip() if len(row) > 3 else ""
+        if not is_savings_category(row_category):
+            continue
+
+        total += parse_currency_value(row[5] if len(row) > 5 else "")
+
+    return total
 
 def get_expenses_by_category(category: str, start: date, end: date) -> list[dict]:
     rows = get_launch_rows()
@@ -255,6 +273,9 @@ def get_expenses_by_category(category: str, start: date, end: date) -> list[dict
             continue
 
         row_category = row[3].strip() if len(row) > 3 else ""
+        if is_savings_category(row_category):
+            continue
+
         if normalize_text(row_category) != category_norm:
             continue
 
@@ -341,7 +362,7 @@ async def transcribe_audio(file_path: str) -> str:
 def parse_expense(text: str, sender: str) -> dict:
     today = datetime.now(AMSTERDAM_TZ).strftime("%d/%m/%Y")
     week_num = datetime.now(AMSTERDAM_TZ).isocalendar()[1]
-    cats = ", ".join(CATEGORIES)
+    cats = ", ".join(VALID_CATEGORIES)
 
     if is_summary_request(text):
         return {"is_summary_request": True}
@@ -349,7 +370,7 @@ def parse_expense(text: str, sender: str) -> dict:
     prompt = f"""Você é um assistente de controle financeiro de casal que mora na Holanda.
 A moeda usada é o Euro (€).
 
-O texto abaixo foi dito por **{sender}** e descreve um gasto.
+O texto abaixo foi dito por **{sender}** e descreve um lançamento financeiro.
 Hoje: {today} | Semana ISO: {week_num}
 
 Extraia e responda APENAS com JSON válido (sem markdown, sem explicação):
@@ -372,7 +393,9 @@ Regras:
 - pago_com: "Débito" se não mencionado
 - valor: número puro sem símbolo (ex: 32.50)
 - data: hoje se não mencionada ({today})
-- descricao: nome do estabelecimento ou produto
+- descricao: nome do estabelecimento, produto ou objetivo
+- Se o texto falar em poupança, guardar dinheiro, reserva, fundo ou economia acumulada, use categoria "{SAVINGS_CATEGORY}"
+- "{SAVINGS_CATEGORY}" não é gasto mensal; é um fundo acumulado
 
 Texto: "{text}"
 """
@@ -413,13 +436,14 @@ def insert_lancamento(expense: dict) -> int:
         if target_row is None:
             target_row = len(all_vals) + 1
 
-    # Store the amount as a real number, not as a formatted text string.
-    # Currency formatting must be handled by the Google Sheets column format.
     valor_float = round(float(expense["valor"]), 2)
+    categoria = expense.get("categoria", "Outros")
+    if is_savings_category(categoria):
+        categoria = SAVINGS_CATEGORY
 
     row_data = [
         expense["data"], expense["semana"], expense["quem_pagou"],
-        expense["categoria"], expense.get("descricao", ""),
+        categoria, expense.get("descricao", ""),
         valor_float, expense["pago_com"], expense.get("observacao", "")
     ]
 
@@ -447,6 +471,9 @@ def get_category_insights(start: date, end: date) -> list[dict]:
             continue
         try:
             categoria = row[0].strip()
+            if is_savings_category(categoria):
+                continue
+
             meta = parse_currency_value(row[1]) if len(row) > 1 else 0.0
             gasto = monthly_spend.get(categoria, 0.0)
             saldo = meta - gasto
@@ -458,33 +485,43 @@ def get_category_insights(start: date, end: date) -> list[dict]:
 
     return insights
 
-# ─── Build confirmation message (category only) ──────────────────────────────
+# ─── Build confirmation message ─────────────────────────────────────────────
 def build_confirmation(expense: dict, insights: list[dict], start: date) -> str:
-    this_cat = next((i for i in insights if i["categoria"] == expense["categoria"]), None)
+    categoria = expense.get("categoria", "")
+
+    if is_savings_category(categoria):
+        return (
+            "✅ *Poupança registrada!*\n\n"
+            f"👤 *{expense['quem_pagou']}*\n"
+            f"💶 *{format_eur(float(expense['valor']))}*\n"
+            f"📝 {expense.get('descricao', 'Poupança')}"
+        )
+
+    this_cat = next((i for i in insights if i["categoria"] == categoria), None)
 
     lines = []
     lines.append(f"✅ *Lançado com sucesso!*\n")
     lines.append(f"👤 *{expense['quem_pagou']}*")
-    lines.append(f"📂 {expense['categoria']}  |  📝 {expense.get('descricao', '–')}")
+    lines.append(f"📂 {categoria}  |  📝 {expense.get('descricao', '–')}")
     lines.append(f"💶 *€ {float(expense['valor']):.2f}*  ({expense['pago_com']})")
     if expense.get("observacao"):
         lines.append(f"💬 _{expense['observacao']}_")
 
     lines.append("")
     if this_cat and this_cat["meta"] > 0:
-        lines.append(f"📊 *{expense['categoria']} — {period_label(start)}:*")
+        lines.append(f"📊 *{categoria} — {period_label(start)}:*")
         lines.append(f"`{progress_bar(this_cat['pct'])}`")
         lines.append(f"Gasto {format_eur(this_cat['gasto'])}  /  Meta {format_eur(this_cat['meta'])}  |  Saldo {format_eur(this_cat['saldo'])}")
 
         if this_cat['pct'] >= 100:
-            lines.append(f"\n🔴 *Atenção! Meta de {expense['categoria']} estourada!*")
+            lines.append(f"\n🔴 *Atenção! Meta de {categoria} estourada!*")
         elif this_cat['pct'] >= 75:
-            lines.append(f"\n🟡 Quase no limite de {expense['categoria']}!")
+            lines.append(f"\n🟡 Quase no limite de {categoria}!")
 
     return "\n".join(lines)
 
 # ─── Build full summary ──────────────────────────────────────────────────────
-def build_full_summary(insights: list[dict], start: date, title: str = None) -> str:
+def build_full_summary(insights: list[dict], start: date, savings_total: float, title: str = None) -> str:
     if not title:
         title = f"📊 *Resumo Mensal — {period_label(start)}*"
 
@@ -503,8 +540,9 @@ def build_full_summary(insights: list[dict], start: date, title: str = None) -> 
         total_meta += cat["meta"]
 
     total_pct = (total_gasto / total_meta * 100) if total_meta > 0 else 0
-    lines.append(f"💰 *TOTAL: {format_eur(total_gasto)} / {format_eur(total_meta)}*")
+    lines.append(f"💰 *TOTAL GASTOS: {format_eur(total_gasto)} / {format_eur(total_meta)}*")
     lines.append(f"`{progress_bar(total_pct)}`")
+    lines.append(f"🏦 *Poupança: {format_eur(savings_total)}*")
 
     over    = [i for i in sorted_cats if i["pct"] >= 100]
     warning = [i for i in sorted_cats if 75 <= i["pct"] < 100]
@@ -524,7 +562,8 @@ async def reply_summary(update: Update, text: str):
     start, end = extract_period_from_text(text)
     await update.message.reply_text(f"📊 Carregando resumo de {period_label(start)}...")
     insights = get_category_insights(start, end)
-    reply = build_full_summary(insights, start)
+    savings_total = get_savings_total()
+    reply = build_full_summary(insights, start, savings_total)
     await update.message.reply_text(reply, parse_mode="Markdown")
 
 async def reply_category_list(update: Update, text: str):
@@ -547,9 +586,10 @@ async def send_weekly_summary(context) -> None:
     try:
         start, end = current_month_bounds()
         insights = get_category_insights(start, end)
+        savings_total = get_savings_total()
         now = datetime.now(AMSTERDAM_TZ)
         title = f"📊 *Resumo Semanal — {now.strftime('%d/%m/%Y')}*"
-        msg = build_full_summary(insights, start, title)
+        msg = build_full_summary(insights, start, savings_total, title)
         await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
         logger.info(f"Weekly summary sent to {chat_id}")
     except Exception as e:
@@ -587,6 +627,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         expense = parsed
+        if is_savings_category(expense.get("categoria", "")):
+            expense["categoria"] = SAVINGS_CATEGORY
+
         insert_lancamento(expense)
         start, end = bounds_from_date(expense.get("data"))
         insights = get_category_insights(start, end)
@@ -634,6 +677,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reply_summary(update, text)
             return
 
+        if is_savings_category(expense.get("categoria", "")):
+            expense["categoria"] = SAVINGS_CATEGORY
+
         insert_lancamento(expense)
         start, end = bounds_from_date(expense.get("data"))
         insights = get_category_insights(start, end)
@@ -665,6 +711,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 *Bot de Gastos — Rafa & Renata* ativo!\n\n"
         "🎙️ Mande um *áudio* com o gasto:\n"
         "_Gastei 32 euros no supermercado, débito_\n\n"
+        "🏦 Para registrar poupança:\n"
+        "_poupança 100 euros_\n"
+        "_guardei 250 euros na poupança_\n\n"
         "📊 Para ver resumo por mês:\n"
         "_resumo_\n"
         "_resumo de junho_\n"
