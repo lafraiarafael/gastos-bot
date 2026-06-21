@@ -5,8 +5,8 @@ import tempfile
 import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from telegram import Update
-from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
 from openai import OpenAI
 import gspread
 from google.oauth2.service_account import Credentials
@@ -68,6 +68,10 @@ def parse_expense(text: str, sender: str) -> dict:
     summary_keywords = ["resumo", "summary", "relatório", "relatorio", "como estamos", "situação", "situacao"]
     if any(kw in text.lower() for kw in summary_keywords):
         return {"is_summary_request": True}
+
+    delete_keywords = ["remove", "remover", "apaga", "apagar", "deleta", "deletar", "exclui", "excluir", "cancela esse lançamento", "cancelar lançamento", "errei", "lancei errado", "lancei por engano"]
+    if any(kw in text.lower() for kw in delete_keywords):
+        return {"is_delete_request": True, "delete_query": text}
 
     prompt = f"""Você é um assistente de controle financeiro de casal que mora na Holanda.
 A moeda usada é o Euro (€).
@@ -157,6 +161,72 @@ def insert_lancamento(expense: dict) -> int:
 
     logger.info(f"Row {target_row}: {row_data}")
     return target_row
+
+# ─── Find rows matching a delete request ─────────────────────────────────────
+def find_matching_lancamentos(query: str, sender: str, max_results: int = 5) -> list[dict]:
+    """Search the last ~60 days of Lançamentos for rows matching the query text."""
+    sh = gc.open_by_key(SPREADSHEET_ID)
+    ws = sh.worksheet("Lançamentos")
+    all_rows = ws.get_all_values()
+
+    candidates = []
+    for idx, row in enumerate(all_rows):
+        if idx < 2:
+            continue
+        if len(row) < 6:
+            continue
+        date_cell, week_cell, who_cell, cat_cell, desc_cell, val_cell = row[0], row[1], row[2], row[3], row[4], row[5]
+        if not date_cell.strip() or not cat_cell.strip():
+            continue
+        candidates.append({
+            "row_number": idx + 1,
+            "data": date_cell,
+            "quem_pagou": who_cell,
+            "categoria": cat_cell,
+            "descricao": desc_cell,
+            "valor_raw": val_cell,
+            "observacao": row[7] if len(row) > 7 else ""
+        })
+
+    if not candidates:
+        return []
+
+    # Use GPT to rank/match candidates against the query (most recent 40 rows considered)
+    recent = candidates[-40:]
+    candidates_str = "\n".join([
+        f"{c['row_number']}: {c['data']} | {c['quem_pagou']} | {c['categoria']} | {c['descricao']} | {c['valor_raw']} | {c['observacao']}"
+        for c in recent
+    ])
+
+    prompt = f"""O usuário {sender} quer apagar um lançamento de despesa. Aqui está o pedido dele:
+"{query}"
+
+Aqui está a lista de lançamentos recentes (formato: row_number: data | quem_pagou | categoria | descrição | valor | observação):
+{candidates_str}
+
+Responda APENAS com um JSON contendo os números das linhas (row_number) que melhor correspondem ao pedido, ordenados do mais provável ao menos provável, no máximo {max_results}:
+{{"matches": [<row_number>, ...]}}
+
+Se nenhuma linha corresponder bem, retorne {{"matches": []}}.
+"""
+    resp = openai_client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+        response_format={"type": "json_object"}
+    )
+    result = json.loads(resp.choices[0].message.content)
+    matched_rows = result.get("matches", [])
+
+    by_row = {c["row_number"]: c for c in candidates}
+    return [by_row[r] for r in matched_rows if r in by_row][:max_results]
+
+# ─── Delete a specific row (clear its contents) ──────────────────────────────
+def delete_lancamento_row(row_number: int):
+    sh = gc.open_by_key(SPREADSHEET_ID)
+    ws = sh.worksheet("Lançamentos")
+    ws.batch_clear([f"A{row_number}:H{row_number}"])
+    logger.info(f"Cleared row {row_number}")
 
 # ─── Get insights (expenses + savings) ───────────────────────────────────────
 def get_category_insights() -> tuple[list[dict], float]:
@@ -300,6 +370,65 @@ async def send_weekly_summary(context) -> None:
     except Exception as e:
         logger.error(f"Weekly summary error: {e}", exc_info=True)
 
+# ─── Handle delete request (find candidates + ask confirmation) ─────────────
+async def handle_delete_request(update: Update, context: ContextTypes.DEFAULT_TYPE, query_text: str, sender: str):
+    await update.message.reply_text("🔍 Procurando o lançamento...")
+    try:
+        matches = find_matching_lancamentos(query_text, sender)
+
+        if not matches:
+            await update.message.reply_text(
+                "❌ Não encontrei nenhum lançamento que combine com isso.\n"
+                "Tenta descrever melhor (ex: \"remove a compra da Hornbach\")."
+            )
+            return
+
+        if len(matches) == 1:
+            m = matches[0]
+            keyboard = [[
+                InlineKeyboardButton("✅ Sim, apagar", callback_data=f"delrow_{m['row_number']}"),
+                InlineKeyboardButton("❌ Cancelar", callback_data="delrow_cancel"),
+            ]]
+            text = (
+                f"Encontrei este lançamento:\n\n"
+                f"📅 {m['data']} | 👤 {m['quem_pagou']}\n"
+                f"📂 {m['categoria']} | 📝 {m['descricao']}\n"
+                f"💶 {m['valor_raw']}\n\n"
+                f"Quer apagar?"
+            )
+            await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        else:
+            keyboard = []
+            lines = ["Encontrei alguns lançamentos parecidos, qual deles?\n"]
+            for m in matches:
+                label = f"{m['data']} | {m['categoria']} | {m['descricao']} | {m['valor_raw']}"
+                lines.append(f"• {label}")
+                keyboard.append([InlineKeyboardButton(label[:60], callback_data=f"delrow_{m['row_number']}")])
+            keyboard.append([InlineKeyboardButton("❌ Cancelar", callback_data="delrow_cancel")])
+            await update.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard))
+
+    except Exception as e:
+        logger.error(f"Delete search error: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Erro ao buscar: `{e}`", parse_mode="Markdown")
+
+# ─── Callback handler for delete confirmation buttons ────────────────────────
+async def handle_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "delrow_cancel":
+        await query.edit_message_text("❌ Cancelado. Nada foi apagado.")
+        return
+
+    if query.data.startswith("delrow_"):
+        row_number = int(query.data.replace("delrow_", ""))
+        try:
+            delete_lancamento_row(row_number)
+            await query.edit_message_text("🗑️ Lançamento apagado com sucesso!")
+        except Exception as e:
+            logger.error(f"Delete row error: {e}", exc_info=True)
+            await query.edit_message_text(f"❌ Erro ao apagar: `{e}`")
+
 # ─── Voice handler ────────────────────────────────────────────────────────────
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender = identify_sender(update)
@@ -320,6 +449,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if parsed.get("is_summary_request"):
             insights, savings = get_category_insights()
             await update.message.reply_text(build_full_summary(insights, savings), parse_mode="Markdown")
+            return
+
+        if parsed.get("is_delete_request"):
+            await handle_delete_request(update, context, parsed.get("delete_query", transcript), sender)
             return
 
         insert_lancamento(parsed)
@@ -344,6 +477,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(build_full_summary(insights, savings), parse_mode="Markdown")
         return
 
+    delete_keywords = ["remove", "remover", "apaga", "apagar", "deleta", "deletar", "exclui", "excluir", "errei", "lancei errado", "lancei por engano"]
+    if any(kw in text.lower() for kw in delete_keywords):
+        await handle_delete_request(update, context, text, sender)
+        return
+
     if not re.search(r'\d', text):
         return
 
@@ -353,6 +491,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if expense.get("is_summary_request"):
             insights, savings = get_category_insights()
             await update.message.reply_text(build_full_summary(insights, savings), parse_mode="Markdown")
+            return
+        if expense.get("is_delete_request"):
+            await handle_delete_request(update, context, text, sender)
             return
         insert_lancamento(expense)
         insights, savings = get_category_insights()
@@ -403,6 +544,7 @@ def main():
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start",  start))
     app.add_handler(CommandHandler("resumo", resumo))
+    app.add_handler(CallbackQueryHandler(handle_delete_callback, pattern="^delrow_"))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     logger.info("🤖 Bot iniciado!")
