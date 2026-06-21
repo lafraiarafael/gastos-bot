@@ -221,6 +221,45 @@ Se nenhuma linha corresponder bem, retorne {{"matches": []}}.
     by_row = {c["row_number"]: c for c in candidates}
     return [by_row[r] for r in matched_rows if r in by_row][:max_results]
 
+# ─── List expenses by category (current month) ──────────────────────────────
+def list_expenses_by_category(categoria: str) -> list[dict]:
+    sh = gc.open_by_key(SPREADSHEET_ID)
+    ws = sh.worksheet("Lançamentos")
+    all_rows = ws.get_all_values()
+
+    now = datetime.now(AMSTERDAM_TZ)
+    current_month = now.month
+    current_year = now.year
+
+    results = []
+    for row in all_rows[2:]:
+        if len(row) < 6:
+            continue
+        cat_cell = row[3].strip() if len(row) > 3 else ""
+        if cat_cell != categoria:
+            continue
+        date_str = row[0].strip()
+        if not date_str:
+            continue
+        try:
+            parts = date_str.split("/")
+            if len(parts) == 3:
+                day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
+                year = 2000 + year if year < 100 else year
+                if month == current_month and year == current_year:
+                    results.append({
+                        "data": date_str,
+                        "quem_pagou": row[2],
+                        "descricao": row[4],
+                        "valor_raw": row[5],
+                        "pago_com": row[6] if len(row) > 6 else "",
+                        "observacao": row[7] if len(row) > 7 else ""
+                    })
+        except Exception as e:
+            logger.warning(f"List expenses parse error: {row} → {e}")
+
+    return results
+
 # ─── Delete a specific row (clear its contents) ──────────────────────────────
 def delete_lancamento_row(row_number: int):
     sh = gc.open_by_key(SPREADSHEET_ID)
@@ -525,7 +564,92 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "_\"Guardei 200 euros este mês\"_\n\n"
         "📊 Para ver o resumo:\n"
         "_\"resumo\"_ ou `/resumo`\n\n"
+        "📂 Para ver gastos por categoria:\n"
+        "`/categorias`\n\n"
+        "🗑️ Para apagar um lançamento:\n"
+        "_\"remove a compra do supermercado\"_\n\n"
         "🗓️ Todo segunda-feira às 8h recebem o resumo automático!",
+        parse_mode="Markdown"
+    )
+
+# ─── /categorias — menu to pick a category and see its expenses ─────────────
+async def categorias(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = []
+    row = []
+    for i, cat in enumerate(CATEGORIES):
+        row.append(InlineKeyboardButton(cat, callback_data=f"catview_{cat}"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+
+    await update.message.reply_text(
+        "📂 *Escolha uma categoria para ver os gastos do mês:*",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+# ─── Callback handler for category view buttons ─────────────────────────────
+async def handle_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    categoria = query.data.replace("catview_", "")
+    month_name = datetime.now(AMSTERDAM_TZ).strftime("%B").capitalize()
+
+    try:
+        expenses = list_expenses_by_category(categoria)
+
+        if not expenses:
+            await query.edit_message_text(f"📂 *{categoria} — {month_name}*\n\nNenhum gasto registrado este mês.", parse_mode="Markdown")
+            return
+
+        lines = [f"📂 *{categoria} — {month_name}*\n"]
+        total = 0.0
+        for e in expenses:
+            val_str = re.sub(r'[€\s]', '', e["valor_raw"]).replace(".", "").replace(",", ".").strip()
+            try:
+                val = float(val_str) if val_str else 0.0
+            except ValueError:
+                val = 0.0
+            total += val
+            desc = e["descricao"] or "–"
+            obs = f" _({e['observacao']})_" if e["observacao"] else ""
+            lines.append(f"• {e['data']} | {e['quem_pagou']} | {desc} | €{val:.2f}{obs}")
+
+        lines.append(f"\n💰 *Total: €{total:.2f}*")
+
+        # Add a back button
+        keyboard = [[InlineKeyboardButton("⬅️ Voltar às categorias", callback_data="catview_back")]]
+        await query.edit_message_text(
+            "\n".join(lines),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    except Exception as e:
+        logger.error(f"Category view error: {e}", exc_info=True)
+        await query.edit_message_text(f"❌ Erro: `{e}`", parse_mode="Markdown")
+
+# ─── Callback handler for "back to categories" button ────────────────────────
+async def handle_category_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    keyboard = []
+    row = []
+    for cat in CATEGORIES:
+        row.append(InlineKeyboardButton(cat, callback_data=f"catview_{cat}"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+
+    await query.edit_message_text(
+        "📂 *Escolha uma categoria para ver os gastos do mês:*",
+        reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
 
@@ -542,9 +666,12 @@ async def resumo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     app = Application.builder().token(token).build()
-    app.add_handler(CommandHandler("start",  start))
-    app.add_handler(CommandHandler("resumo", resumo))
+    app.add_handler(CommandHandler("start",      start))
+    app.add_handler(CommandHandler("resumo",     resumo))
+    app.add_handler(CommandHandler("categorias", categorias))
     app.add_handler(CallbackQueryHandler(handle_delete_callback, pattern="^delrow_"))
+    app.add_handler(CallbackQueryHandler(handle_category_back, pattern="^catview_back$"))
+    app.add_handler(CallbackQueryHandler(handle_category_callback, pattern="^catview_"))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     logger.info("🤖 Bot iniciado!")
