@@ -10,6 +10,12 @@ from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQu
 from openai import OpenAI
 import gspread
 from google.oauth2.service_account import Credentials
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import cm
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -26,6 +32,17 @@ gc = gspread.authorize(creds)
 
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "1MZeWj4emurdqv4YG1eusCIXop1rI7qru3UHHIcqqMaA")
 AMSTERDAM_TZ = ZoneInfo("Europe/Amsterdam")
+
+# In-memory cache for expenses pending confirmation (keyed by a short id)
+PENDING_EXPENSES = {}
+_pending_counter = 0
+
+def store_pending(expense: dict) -> str:
+    global _pending_counter
+    _pending_counter += 1
+    key = str(_pending_counter % 100000)
+    PENDING_EXPENSES[key] = expense
+    return key
 
 CATEGORIES = [
     "Alimentação", "Transporte", "Moradia", "Utilidades",
@@ -112,7 +129,34 @@ Texto: "{text}"
         temperature=0,
         response_format={"type": "json_object"}
     )
-    return json.loads(resp.choices[0].message.content)
+    result = json.loads(resp.choices[0].message.content)
+
+    # ── Validation (auditoria de erros silenciosos) ──
+    if not result.get("is_summary_request") and not result.get("is_delete_request"):
+        warnings = []
+
+        if result.get("categoria") not in CATEGORIES:
+            warnings.append(f"⚠️ Categoria \"{result.get('categoria')}\" não existe na lista oficial.")
+            result["categoria"] = "Outros"
+            warnings.append("Usei \"Outros\" como categoria padrão.")
+
+        try:
+            valor = float(result.get("valor", 0))
+            if valor == 0:
+                warnings.append("⚠️ Não consegui identificar um valor válido (ficou 0).")
+            result["valor"] = valor
+        except (ValueError, TypeError):
+            warnings.append(f"⚠️ Valor \"{result.get('valor')}\" inválido, ficou 0.")
+            result["valor"] = 0.0
+
+        if result.get("quem_pagou") not in ["Rafa", "Renata"]:
+            warnings.append(f"⚠️ Pessoa \"{result.get('quem_pagou')}\" não reconhecida, usei \"{sender}\".")
+            result["quem_pagou"] = sender
+
+        if warnings:
+            result["_warnings"] = warnings
+
+    return result
 
 # ─── Insert lancamento ────────────────────────────────────────────────────────
 def insert_lancamento(expense: dict) -> int:
@@ -352,6 +396,9 @@ def build_confirmation(expense: dict, insights: list[dict], savings: float) -> s
                 lines.append(f"\n🔴 *Meta de {expense['categoria']} estourada!*")
             elif this_cat['pct'] >= 75:
                 lines.append(f"\n🟡 Quase no limite de {expense['categoria']}!")
+        elif this_cat:
+            lines.append(f"📊 *{expense['categoria']} — {month_name}:*")
+            lines.append(f"Gasto total: €{this_cat['gasto']:.2f}  _(sem meta definida)_")
 
     return "\n".join(lines)
 
@@ -365,19 +412,27 @@ def build_full_summary(insights: list[dict], savings: float, title: str = None) 
     total_gasto = 0
     total_meta = 0
 
-    sorted_cats = sorted([i for i in insights if i["meta"] > 0], key=lambda x: x["pct"], reverse=True)
+    sorted_cats = sorted([i for i in insights if i["meta"] > 0 or i["gasto"] > 0], key=lambda x: x["pct"], reverse=True)
 
+    total_gasto_geral = 0.0
     for cat in sorted_cats:
         lines.append(f"*{cat['categoria']}*")
-        lines.append(f"`{progress_bar(cat['pct'])}`")
-        lines.append(f"€{cat['gasto']:.2f} / €{cat['meta']:.2f}  |  Saldo €{cat['saldo']:.2f}")
+        if cat["meta"] > 0:
+            lines.append(f"`{progress_bar(cat['pct'])}`")
+            lines.append(f"€{cat['gasto']:.2f} / €{cat['meta']:.2f}  |  Saldo €{cat['saldo']:.2f}")
+            total_gasto += cat["gasto"]
+            total_meta += cat["meta"]
+        else:
+            lines.append(f"€{cat['gasto']:.2f}  _(sem meta definida)_")
         lines.append("")
-        total_gasto += cat["gasto"]
-        total_meta += cat["meta"]
+        total_gasto_geral += cat["gasto"]
 
     total_pct = (total_gasto / total_meta * 100) if total_meta > 0 else 0
-    lines.append(f"💰 *TOTAL GASTOS: €{total_gasto:.2f} / €{total_meta:.2f}*")
+    lines.append(f"💰 *TOTAL GASTOS (com meta): €{total_gasto:.2f} / €{total_meta:.2f}*")
     lines.append(f"`{progress_bar(total_pct)}`")
+    sem_meta = total_gasto_geral - total_gasto
+    if sem_meta > 0:
+        lines.append(f"_+ €{sem_meta:.2f} em categorias sem meta_")
 
     # Savings — separate, never mixed with expenses
     lines.append("")
@@ -395,6 +450,79 @@ def build_full_summary(insights: list[dict], savings: float, title: str = None) 
         lines.append(f"🟡 Atenção (>75%): {names}")
 
     return "\n".join(lines)
+
+# ─── Generate monthly PDF report ─────────────────────────────────────────────
+def generate_monthly_pdf(insights: list[dict], savings: float) -> str:
+    now = datetime.now(AMSTERDAM_TZ)
+    month_name = now.strftime("%B").capitalize()
+    filepath = f"/tmp/relatorio_{now.strftime('%Y_%m')}.pdf"
+
+    doc = SimpleDocTemplate(filepath, pagesize=A4,
+                             topMargin=1.5*cm, bottomMargin=1.5*cm,
+                             leftMargin=1.5*cm, rightMargin=1.5*cm)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("TitleCustom", parent=styles["Title"], fontSize=20, alignment=TA_CENTER, spaceAfter=4)
+    subtitle_style = ParagraphStyle("Subtitle", parent=styles["Normal"], fontSize=12, alignment=TA_CENTER, textColor=colors.grey, spaceAfter=20)
+
+    elements = []
+    elements.append(Paragraph(f"💰 Relatório de Gastos — {month_name} {now.year}", title_style))
+    elements.append(Paragraph("Rafa &amp; Renata", subtitle_style))
+
+    # Table data
+    table_data = [["Categoria", "Gasto (€)", "Meta (€)", "Saldo (€)", "% Meta"]]
+    total_gasto, total_meta = 0.0, 0.0
+
+    sorted_cats = sorted(insights, key=lambda x: x["gasto"], reverse=True)
+    for cat in sorted_cats:
+        if cat["meta"] == 0 and cat["gasto"] == 0:
+            continue
+        table_data.append([
+            cat["categoria"],
+            f"{cat['gasto']:.2f}",
+            f"{cat['meta']:.2f}" if cat["meta"] > 0 else "–",
+            f"{cat['saldo']:.2f}" if cat["meta"] > 0 else "–",
+            f"{cat['pct']:.0f}%" if cat["meta"] > 0 else "–",
+        ])
+        if cat["meta"] > 0:
+            total_gasto += cat["gasto"]
+            total_meta += cat["meta"]
+
+    table_data.append(["TOTAL", f"{total_gasto:.2f}", f"{total_meta:.2f}", f"{total_meta-total_gasto:.2f}",
+                        f"{(total_gasto/total_meta*100) if total_meta else 0:.0f}%"])
+
+    table = Table(table_data, colWidths=[5*cm, 3*cm, 3*cm, 3*cm, 2.5*cm])
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2d2d2d")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+        ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#e8e8e8")),
+        ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -2), [colors.white, colors.HexColor("#f5f5f5")]),
+        ("FONTSIZE", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    elements.append(table)
+    elements.append(Spacer(1, 20))
+
+    savings_style = ParagraphStyle("Savings", parent=styles["Normal"], fontSize=13, textColor=colors.HexColor("#1a7a3c"))
+    elements.append(Paragraph(f"🐷 Fundo Poupança (acumulado): € {savings:.2f}", savings_style))
+
+    over = [c for c in insights if c["pct"] >= 100 and c["meta"] > 0]
+    if over:
+        elements.append(Spacer(1, 10))
+        alert_style = ParagraphStyle("Alert", parent=styles["Normal"], fontSize=11, textColor=colors.HexColor("#c0392b"))
+        names = ", ".join([c["categoria"] for c in over])
+        elements.append(Paragraph(f"🔴 Categorias que estouraram a meta: {names}", alert_style))
+
+    elements.append(Spacer(1, 30))
+    footer_style = ParagraphStyle("Footer", parent=styles["Normal"], fontSize=8, textColor=colors.grey, alignment=TA_CENTER)
+    elements.append(Paragraph(f"Gerado automaticamente em {now.strftime('%d/%m/%Y %H:%M')} (Amsterdam)", footer_style))
+
+    doc.build(elements)
+    return filepath
 
 # ─── Weekly summary job ───────────────────────────────────────────────────────
 async def send_weekly_summary(context) -> None:
@@ -467,6 +595,97 @@ async def handle_delete_callback(update: Update, context: ContextTypes.DEFAULT_T
             logger.error(f"Delete row error: {e}", exc_info=True)
             await query.edit_message_text(f"❌ Erro ao apagar: `{e}`")
 
+# ─── Build preview message for confirmation ──────────────────────────────────
+def build_preview(expense: dict) -> str:
+    is_savings = expense["categoria"] == "Poupança"
+    valor = float(expense["valor"])
+
+    lines = ["🔎 *Confirma esse lançamento?*\n"]
+    lines.append(f"👤 {expense['quem_pagou']}")
+    if is_savings:
+        action = "Retirada da" if valor < 0 else "Depósito na"
+        lines.append(f"🐷 {action} Poupança")
+        lines.append(f"💶 € {abs(valor):.2f}  ({expense['pago_com']})")
+    else:
+        lines.append(f"📂 {expense['categoria']}")
+        lines.append(f"📝 {expense.get('descricao', '–')}")
+        lines.append(f"💶 € {valor:.2f}  ({expense['pago_com']})")
+    if expense.get("observacao"):
+        lines.append(f"💬 {expense['observacao']}")
+
+    if expense.get("_warnings"):
+        lines.append("")
+        for w in expense["_warnings"]:
+            lines.append(w)
+
+    return "\n".join(lines)
+
+# ─── Callback handler for expense confirmation ───────────────────────────────
+async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "exp_cancel":
+        await query.edit_message_text("❌ Cancelado. Nada foi lançado.")
+        return
+
+    if query.data.startswith("exp_confirm_"):
+        key = query.data.replace("exp_confirm_", "")
+        expense = PENDING_EXPENSES.pop(key, None)
+        if not expense:
+            await query.edit_message_text("⚠️ Esse lançamento expirou, manda de novo por favor.")
+            return
+
+        try:
+            insert_lancamento(expense)
+            insights, savings = get_category_insights()
+            reply = build_confirmation(expense, insights, savings)
+            await query.edit_message_text(reply, parse_mode="Markdown")
+
+            # Proactive alert check (90%+) on the affected category
+            await check_and_send_alert(context, query.message.chat_id, expense, insights)
+
+        except Exception as e:
+            logger.error(f"Confirm insert error: {e}", exc_info=True)
+            await query.edit_message_text(f"❌ Erro ao lançar: `{e}`", parse_mode="Markdown")
+        return
+
+    if query.data.startswith("exp_edit_"):
+        key = query.data.replace("exp_edit_", "")
+        expense = PENDING_EXPENSES.get(key)
+        if not expense:
+            await query.edit_message_text("⚠️ Esse lançamento expirou, manda de novo por favor.")
+            return
+        await query.edit_message_text(
+            "✏️ Manda a versão corrigida em texto ou áudio (ex: \"era 25 euros, não 35\")."
+        )
+        PENDING_EXPENSES.pop(key, None)
+
+# ─── Proactive alert when a category crosses 90% ─────────────────────────────
+async def check_and_send_alert(context, chat_id, expense: dict, insights: list[dict]):
+    if expense["categoria"] == "Poupança":
+        return
+    this_cat = next((i for i in insights if i["categoria"] == expense["categoria"]), None)
+    if not this_cat or this_cat["meta"] <= 0:
+        return
+    if this_cat["pct"] >= 90:
+        try:
+            if this_cat["pct"] >= 100:
+                msg = (
+                    f"🔴 *Alerta de orçamento!*\n\n"
+                    f"*{expense['categoria']}* ultrapassou a meta este mês.\n"
+                    f"Gasto: €{this_cat['gasto']:.2f} / Meta: €{this_cat['meta']:.2f}"
+                )
+            else:
+                msg = (
+                    f"🟡 *Atenção!*\n\n"
+                    f"*{expense['categoria']}* já está em {this_cat['pct']:.0f}% da meta.\n"
+                    f"Faltam apenas €{this_cat['saldo']:.2f} para estourar."
+                )
+            await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Alert send error: {e}", exc_info=True)
+
 # ─── Voice handler ────────────────────────────────────────────────────────────
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender = identify_sender(update)
@@ -493,9 +712,15 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_delete_request(update, context, parsed.get("delete_query", transcript), sender)
             return
 
-        insert_lancamento(parsed)
-        insights, savings = get_category_insights()
-        await update.message.reply_text(build_confirmation(parsed, insights, savings), parse_mode="Markdown")
+        key = store_pending(parsed)
+        keyboard = [[
+            InlineKeyboardButton("✅ Confirmar", callback_data=f"exp_confirm_{key}"),
+            InlineKeyboardButton("✏️ Editar", callback_data=f"exp_edit_{key}"),
+            InlineKeyboardButton("❌ Cancelar", callback_data="exp_cancel"),
+        ]]
+        await update.message.reply_text(
+            build_preview(parsed), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
     except Exception as e:
         logger.error(f"Voice error: {e}", exc_info=True)
@@ -533,9 +758,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if expense.get("is_delete_request"):
             await handle_delete_request(update, context, text, sender)
             return
-        insert_lancamento(expense)
-        insights, savings = get_category_insights()
-        await update.message.reply_text(build_confirmation(expense, insights, savings), parse_mode="Markdown")
+
+        key = store_pending(expense)
+        keyboard = [[
+            InlineKeyboardButton("✅ Confirmar", callback_data=f"exp_confirm_{key}"),
+            InlineKeyboardButton("✏️ Editar", callback_data=f"exp_edit_{key}"),
+            InlineKeyboardButton("❌ Cancelar", callback_data="exp_cancel"),
+        ]]
+        await update.message.reply_text(
+            build_preview(expense), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard)
+        )
     except Exception as e:
         logger.error(f"Text error: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Erro: `{e}`", parse_mode="Markdown")
@@ -555,6 +787,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data=chat_id
     )
 
+    # Daily check for last day of month → triggers PDF report
+    monthly_job_name = f"monthly_check_{chat_id}"
+    for job in context.job_queue.get_jobs_by_name(monthly_job_name):
+        job.schedule_removal()
+
+    context.job_queue.run_daily(
+        check_last_day_of_month,
+        time=datetime.now(AMSTERDAM_TZ).replace(hour=20, minute=0, second=0, microsecond=0).timetz(),
+        name=monthly_job_name,
+        data=chat_id
+    )
+
     await update.message.reply_text(
         "👋 *Bot de Gastos — Rafa & Renata* ativo!\n\n"
         "🎙️ Mande um *áudio* com o gasto:\n"
@@ -565,9 +809,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "_\"resumo\"_ ou `/resumo`\n\n"
         "📂 Para ver gastos por categoria:\n"
         "`/categorias`\n\n"
+        "📄 Para gerar um relatório PDF:\n"
+        "`/relatorio`\n\n"
         "🗑️ Para apagar um lançamento:\n"
         "_\"remove a compra do supermercado\"_\n\n"
-        "🗓️ Todo segunda-feira às 8h recebem o resumo automático!",
+        "✅ Todo lançamento pede confirmação antes de salvar!\n\n"
+        "🗓️ Toda segunda-feira às 8h: resumo automático\n"
+        "🗓️ Todo fim de mês às 20h: relatório PDF automático",
         parse_mode="Markdown"
     )
 
@@ -661,16 +909,50 @@ async def resumo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Erro: `{e}`", parse_mode="Markdown")
 
+# ─── /relatorio — PDF mensal ──────────────────────────────────────────────────
+async def relatorio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📄 Gerando relatório PDF...")
+    try:
+        insights, savings = get_category_insights()
+        filepath = generate_monthly_pdf(insights, savings)
+        with open(filepath, "rb") as f:
+            await update.message.reply_document(document=f, filename=os.path.basename(filepath))
+    except Exception as e:
+        logger.error(f"PDF error: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Erro ao gerar PDF: `{e}`", parse_mode="Markdown")
+
+# ─── Monthly PDF job (last day of month, 20h Amsterdam) ──────────────────────
+async def send_monthly_pdf(context) -> None:
+    chat_id = context.job.data
+    try:
+        insights, savings = get_category_insights()
+        filepath = generate_monthly_pdf(insights, savings)
+        with open(filepath, "rb") as f:
+            await context.bot.send_document(chat_id=chat_id, document=f, filename=os.path.basename(filepath),
+                                              caption="📄 Relatório mensal de gastos!")
+    except Exception as e:
+        logger.error(f"Monthly PDF job error: {e}", exc_info=True)
+
+async def check_last_day_of_month(context) -> None:
+    """Runs daily; sends the PDF only if today is the last day of the month."""
+    now = datetime.now(AMSTERDAM_TZ)
+    tomorrow = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    from datetime import timedelta
+    if (tomorrow + timedelta(days=1)).month != now.month:
+        await send_monthly_pdf(context)
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start",      start))
     app.add_handler(CommandHandler("resumo",     resumo))
+    app.add_handler(CommandHandler("relatorio",  relatorio))
     app.add_handler(CommandHandler("categorias", categorias))
     app.add_handler(CallbackQueryHandler(handle_delete_callback, pattern="^delrow_"))
     app.add_handler(CallbackQueryHandler(handle_category_back, pattern="^catview_back$"))
     app.add_handler(CallbackQueryHandler(handle_category_callback, pattern="^catview_"))
+    app.add_handler(CallbackQueryHandler(handle_expense_callback, pattern="^exp_"))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     logger.info("🤖 Bot iniciado!")
