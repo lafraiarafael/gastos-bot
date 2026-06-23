@@ -143,21 +143,20 @@ def insert_lancamento(expense: dict) -> int:
             target_row = len(all_vals) + 1
 
     valor_float = float(expense["valor"])
-    valor_str = f" €  {valor_float:,.2f} ".replace(",", "X").replace(".", ",").replace("X", ".")
 
     row_data = [
         expense["data"], expense["semana"], expense["quem_pagou"],
         expense["categoria"], expense.get("descricao", ""),
-        valor_str, expense["pago_com"], expense.get("observacao", "")
+        valor_float, expense["pago_com"], expense.get("observacao", "")
     ]
 
     row_vals = all_vals[target_row - 1] if target_row <= len(all_vals) else []
     date_existing = row_vals[0].strip() if row_vals else ""
 
     if date_existing:
-        ws.update(f"A{target_row}:H{target_row}", [row_data])
+        ws.update(f"A{target_row}:H{target_row}", [row_data], value_input_option='USER_ENTERED')
     else:
-        ws.insert_row(row_data, target_row)
+        ws.insert_row(row_data, target_row, value_input_option='USER_ENTERED')
 
     logger.info(f"Row {target_row}: {row_data}")
     return target_row
@@ -432,7 +431,7 @@ async def handle_delete_request(update: Update, context: ContextTypes.DEFAULT_TY
                 f"Encontrei este lançamento:\n\n"
                 f"📅 {m['data']} | 👤 {m['quem_pagou']}\n"
                 f"📂 {m['categoria']} | 📝 {m['descricao']}\n"
-                f"💶 {m['valor_raw']}\n\n"
+                f"💶 €{m['valor_raw']}\n\n"
                 f"Quer apagar?"
             )
             await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -440,7 +439,7 @@ async def handle_delete_request(update: Update, context: ContextTypes.DEFAULT_TY
             keyboard = []
             lines = ["Encontrei alguns lançamentos parecidos, qual deles?\n"]
             for m in matches:
-                label = f"{m['data']} | {m['categoria']} | {m['descricao']} | {m['valor_raw']}"
+                label = f"{m['data']} | {m['categoria']} | {m['descricao']} | €{m['valor_raw']}"
                 lines.append(f"• {label}")
                 keyboard.append([InlineKeyboardButton(label[:60], callback_data=f"delrow_{m['row_number']}")])
             keyboard.append([InlineKeyboardButton("❌ Cancelar", callback_data="delrow_cancel")])
