@@ -390,7 +390,8 @@ def get_month_summary(year: int, month: int) -> dict:
         except ValueError:
             metas[cat] = 0.0
 
-    # Aggregate gastos by category for target month
+    # Aggregate gastos by category for target month ONLY
+    # Poupança is cumulative (all time), so we sum it separately without month filter
     gastos = {}
     savings = 0.0
     for row in all_rows[2:]:
@@ -402,6 +403,15 @@ def get_month_summary(year: int, month: int) -> dict:
         if not cat or not val_str:
             continue
         try:
+            val_clean = re.sub(r'[€ ]', '', val_str).replace(".", "").replace(",", ".").strip()
+            valor = float(val_clean) if val_clean else 0.0
+
+            # Poupança: sum ALL entries regardless of month (cumulative fund)
+            if cat == "Poupança":
+                savings += valor
+                continue
+
+            # Regular expenses: filter by target month/year only
             parts = date_str.split("/")
             if len(parts) != 3:
                 continue
@@ -409,16 +419,10 @@ def get_month_summary(year: int, month: int) -> dict:
             r_year = int(parts[2])
             r_year = 2000 + r_year if r_year < 100 else r_year
             if r_year < 2020:
-                continue  # skip entries with clearly wrong years
+                continue
             if r_month != month or r_year != year:
                 continue
-            # Parse value
-            val_clean = re.sub(r'[€ ]', '', val_str).replace(".", "").replace(",", ".").strip()
-            valor = float(val_clean) if val_clean else 0.0
-            if cat == "Poupança":
-                savings += valor
-            else:
-                gastos[cat] = gastos.get(cat, 0.0) + valor
+            gastos[cat] = gastos.get(cat, 0.0) + valor
         except Exception:
             continue
 
