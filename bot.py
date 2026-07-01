@@ -316,6 +316,8 @@ def list_expenses_by_category(categoria: str) -> list[dict]:
             if len(parts) == 3:
                 day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
                 year = 2000 + year if year < 100 else year
+                if year < 2020:
+                    continue
                 if month == current_month and year == current_year:
                     results.append({
                         "data": date_str,
@@ -349,6 +351,9 @@ def get_available_months() -> list[dict]:
                 month = int(parts[1])
                 year = int(parts[2])
                 year = 2000 + year if year < 100 else year
+                # Skip entries with clearly wrong years (before 2020)
+                if year < 2020:
+                    continue
                 key = (year, month)
                 if key not in months_seen:
                     months_seen[key] = True
@@ -403,6 +408,8 @@ def get_month_summary(year: int, month: int) -> dict:
             r_month = int(parts[1])
             r_year = int(parts[2])
             r_year = 2000 + r_year if r_year < 100 else r_year
+            if r_year < 2020:
+                continue  # skip entries with clearly wrong years
             if r_month != month or r_year != year:
                 continue
             # Parse value
@@ -906,6 +913,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/relatorio`\n\n"
         "🗓️ Para ver resumo por mês:\n"
         "`/meses`\n\n"
+        "🎯 Para ver as metas atuais:\n"
+        "`/metas`\n\n"
         "🗑️ Para apagar um lançamento:\n"
         "_\"remove a compra do supermercado\"_\n\n"
         "✅ Todo lançamento pede confirmação antes de salvar!\n\n"
@@ -1002,6 +1011,45 @@ async def resumo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         insights, savings = get_category_insights()
         await update.message.reply_text(build_full_summary(insights, savings), parse_mode="Markdown")
     except Exception as e:
+        await update.message.reply_text(f"❌ Erro: `{e}`", parse_mode="Markdown")
+
+# ─── /metas — show current monthly goals ─────────────────────────────────────
+async def metas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🎯 Carregando metas...")
+    try:
+        now = datetime.now(AMSTERDAM_TZ)
+        result = get_month_summary(now.year, now.month)
+        insights = result["insights"]
+
+        month_name = now.strftime("%B %Y").capitalize()
+        lines = [f"🎯 *Metas \u2014 {month_name}*\n"]
+
+        # Sort by meta value descending
+        sorted_cats = sorted(
+            [i for i in insights if i["meta"] > 0],
+            key=lambda x: x["meta"], reverse=True
+        )
+        no_meta = [i for i in insights if i["meta"] == 0 and i["gasto"] > 0]
+
+        total_meta = 0.0
+        for cat in sorted_cats:
+            lines.append(f"• *{cat['categoria']}:* €{cat['meta']:.2f}")
+            total_meta += cat["meta"]
+
+        if no_meta:
+            lines.append("")
+            lines.append("_Sem meta definida:_")
+            for cat in no_meta:
+                lines.append(f"• {cat['categoria']}")
+
+        lines.append("")
+        lines.append(f"💰 *Total orçamento: €{total_meta:.2f}*")
+        lines.append("")
+        lines.append("_Para alterar as metas, edita a aba **Metas** na planilha._")
+
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Metas error: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Erro: `{e}`", parse_mode="Markdown")
 
 # ─── /meses — month picker menu ──────────────────────────────────────────────
@@ -1129,6 +1177,7 @@ def main():
     app.add_handler(CommandHandler("relatorio",  relatorio))
     app.add_handler(CommandHandler("categorias", categorias))
     app.add_handler(CommandHandler("meses",      meses))
+    app.add_handler(CommandHandler("metas",      metas))
     app.add_handler(CallbackQueryHandler(handle_delete_callback,  pattern="^delrow_"))
     app.add_handler(CallbackQueryHandler(handle_category_back,    pattern="^catview_back$"))
     app.add_handler(CallbackQueryHandler(handle_category_callback,pattern="^catview_"))
