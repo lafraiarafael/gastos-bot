@@ -33,6 +33,30 @@ gc = gspread.authorize(creds)
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "1MZeWj4emurdqv4YG1eusCIXop1rI7qru3UHHIcqqMaA")
 AMSTERDAM_TZ = ZoneInfo("Europe/Amsterdam")
 
+# ─── Retry decorator for Google Sheets API calls ─────────────────────────────
+import time
+
+def with_retry(max_attempts=3, delay=2):
+    """Retry decorator for Google API calls that may fail with 503."""
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            last_error = None
+            for attempt in range(max_attempts):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_error = e
+                    error_str = str(e).lower()
+                    if any(x in error_str for x in ["503", "unavailable", "quota", "rate limit", "timeout", "500"]):
+                        if attempt < max_attempts - 1:
+                            logger.warning(f"Google API error (attempt {attempt+1}/{max_attempts}): {e}. Retrying in {delay}s...")
+                            time.sleep(delay * (attempt + 1))
+                            continue
+                    raise  # Not a retryable error, raise immediately
+            raise last_error
+        return wrapper
+    return decorator
+
 # In-memory cache for expenses pending confirmation (keyed by a short id)
 PENDING_EXPENSES = {}
 _pending_counter = 0
@@ -159,6 +183,7 @@ Texto: "{text}"
     return result
 
 # ─── Insert lancamento ────────────────────────────────────────────────────────
+@with_retry(max_attempts=3, delay=2)
 def insert_lancamento(expense: dict) -> int:
     sh = gc.open_by_key(SPREADSHEET_ID)
     ws = sh.worksheet("Lançamentos")
@@ -206,6 +231,7 @@ def insert_lancamento(expense: dict) -> int:
     return target_row
 
 # ─── Find rows matching a delete request ─────────────────────────────────────
+@with_retry(max_attempts=3, delay=2)
 def find_matching_lancamentos(query: str, sender: str, max_results: int = 5) -> list[dict]:
     """Search the last ~60 days of Lançamentos for rows matching the query text."""
     sh = gc.open_by_key(SPREADSHEET_ID)
@@ -265,6 +291,7 @@ Se nenhuma linha corresponder bem, retorne {{"matches": []}}.
     return [by_row[r] for r in matched_rows if r in by_row][:max_results]
 
 # ─── List expenses by category (current month) ──────────────────────────────
+@with_retry(max_attempts=3, delay=2)
 def list_expenses_by_category(categoria: str) -> list[dict]:
     sh = gc.open_by_key(SPREADSHEET_ID)
     ws = sh.worksheet("Lançamentos")
@@ -311,6 +338,7 @@ def delete_lancamento_row(row_number: int):
     logger.info(f"Cleared row {row_number}")
 
 # ─── Get insights (expenses + savings) ───────────────────────────────────────
+@with_retry(max_attempts=3, delay=2)
 def get_category_insights() -> tuple[list[dict], float]:
     """Returns (category_insights, total_cumulative_savings)"""
     sh = gc.open_by_key(SPREADSHEET_ID)
@@ -647,7 +675,14 @@ async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_
 
         except Exception as e:
             logger.error(f"Confirm insert error: {e}", exc_info=True)
-            await query.edit_message_text(f"❌ Erro ao lançar: `{e}`", parse_mode="Markdown")
+            error_str = str(e).lower()
+            if any(x in error_str for x in ["503", "unavailable", "quota", "timeout"]):
+                await query.edit_message_text(
+                    "⚠️ O Google Sheets ficou temporariamente fora do ar.\n"
+                    "Tenta confirmar de novo em alguns segundos."
+                )
+            else:
+                await query.edit_message_text(f"❌ Erro ao lançar: `{e}`", parse_mode="Markdown")
         return
 
     if query.data.startswith("exp_edit_"):
