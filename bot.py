@@ -330,6 +330,107 @@ def list_expenses_by_category(categoria: str) -> list[dict]:
 
     return results
 
+# ─── Get all months that have lancamentos ─────────────────────────────────────
+@with_retry(max_attempts=3, delay=2)
+def get_available_months() -> list[dict]:
+    """Returns list of {year, month, label} for all months that have entries."""
+    sh = gc.open_by_key(SPREADSHEET_ID)
+    ws = sh.worksheet("Lançamentos")
+    all_rows = ws.get_all_values()
+
+    months_seen = {}
+    for row in all_rows[2:]:
+        if len(row) < 4 or not row[0].strip() or not row[3].strip():
+            continue
+        date_str = row[0].strip()
+        try:
+            parts = date_str.split("/")
+            if len(parts) == 3:
+                month = int(parts[1])
+                year = int(parts[2])
+                year = 2000 + year if year < 100 else year
+                key = (year, month)
+                if key not in months_seen:
+                    months_seen[key] = True
+        except Exception:
+            continue
+
+    result = []
+    for (year, month) in sorted(months_seen.keys(), reverse=True):
+        from datetime import date
+        dt = date(year, month, 1)
+        label = dt.strftime("%B %Y").capitalize()
+        result.append({"year": year, "month": month, "label": label})
+    return result
+
+# ─── Summarize expenses for a specific month ──────────────────────────────────
+@with_retry(max_attempts=3, delay=2)
+def get_month_summary(year: int, month: int) -> dict:
+    """Read Lançamentos and aggregate by category for a specific month."""
+    sh = gc.open_by_key(SPREADSHEET_ID)
+    ws_lanc = sh.worksheet("Lançamentos")
+    ws_metas = sh.worksheet("Metas")
+    all_rows = ws_lanc.get_all_values()
+    meta_rows = ws_metas.get_all_values()
+
+    # Read metas from Metas tab
+    metas = {}
+    for row in meta_rows[2:]:  # skip title + total row
+        if len(row) < 2 or not row[0].strip():
+            continue
+        cat = row[0].strip()
+        val_str = re.sub(r'[€ \-]', '', row[1]).replace(".", "").replace(",", ".").strip()
+        try:
+            metas[cat] = float(val_str) if val_str and val_str not in ["-", ""] else 0.0
+        except ValueError:
+            metas[cat] = 0.0
+
+    # Aggregate gastos by category for target month
+    gastos = {}
+    savings = 0.0
+    for row in all_rows[2:]:
+        if len(row) < 6 or not row[0].strip():
+            continue
+        date_str = row[0].strip()
+        cat = row[3].strip() if len(row) > 3 else ""
+        val_str = row[5].strip() if len(row) > 5 else ""
+        if not cat or not val_str:
+            continue
+        try:
+            parts = date_str.split("/")
+            if len(parts) != 3:
+                continue
+            r_month = int(parts[1])
+            r_year = int(parts[2])
+            r_year = 2000 + r_year if r_year < 100 else r_year
+            if r_month != month or r_year != year:
+                continue
+            # Parse value
+            val_clean = re.sub(r'[€ ]', '', val_str).replace(".", "").replace(",", ".").strip()
+            valor = float(val_clean) if val_clean else 0.0
+            if cat == "Poupança":
+                savings += valor
+            else:
+                gastos[cat] = gastos.get(cat, 0.0) + valor
+        except Exception:
+            continue
+
+    # Build insights list matching format used in build_full_summary
+    insights = []
+    all_cats = set(list(metas.keys()) + list(gastos.keys()))
+    for cat in all_cats:
+        if cat == "Poupança":
+            continue
+        meta = metas.get(cat, 0.0)
+        gasto = gastos.get(cat, 0.0)
+        if meta == 0 and gasto == 0:
+            continue
+        saldo = meta - gasto
+        pct = (gasto / meta * 100) if meta > 0 else 0.0
+        insights.append({"categoria": cat, "meta": meta, "gasto": gasto, "saldo": saldo, "pct": pct})
+
+    return {"insights": insights, "savings": savings}
+
 # ─── Delete a specific row (clear its contents) ──────────────────────────────
 def delete_lancamento_row(row_number: int):
     sh = gc.open_by_key(SPREADSHEET_ID)
@@ -354,7 +455,7 @@ def get_category_insights() -> tuple[list[dict], float]:
             continue  # skip if it ever appears here
         try:
             def parse_currency(s):
-                s = re.sub(r'[R$€\s]', '', s).replace(".", "").replace(",", ".").strip()
+                s = re.sub(r'[R$€ \t]', '', s).replace(".", "").replace(",", ".").strip()
                 return float(s) if s and s not in ["#DIV/0!", "-", ""] else 0.0
 
             categoria = row[0].strip()
@@ -381,7 +482,7 @@ def get_category_insights() -> tuple[list[dict], float]:
             continue
         try:
             val_str = row[5].strip()
-            val_str = re.sub(r'[€\s]', '', val_str).replace(".", "").replace(",", ".").strip()
+            val_str = re.sub(r'[€ \t]', '', val_str).replace(".", "").replace(",", ".").strip()
             total_savings += float(val_str) if val_str else 0.0
         except Exception as e:
             logger.warning(f"Savings parse error: {row} → {e}")
@@ -846,6 +947,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/categorias`\n\n"
         "📄 Para gerar um relatório PDF:\n"
         "`/relatorio`\n\n"
+        "🗓️ Para ver resumo por mês:\n"
+        "`/meses`\n\n"
         "🗑️ Para apagar um lançamento:\n"
         "_\"remove a compra do supermercado\"_\n\n"
         "✅ Todo lançamento pede confirmação antes de salvar!\n\n"
@@ -890,7 +993,7 @@ async def handle_category_callback(update: Update, context: ContextTypes.DEFAULT
         lines = [f"📂 *{categoria} — {month_name}*\n"]
         total = 0.0
         for e in expenses:
-            val_str = re.sub(r'[€\s]', '', e["valor_raw"]).replace(".", "").replace(",", ".").strip()
+            val_str = re.sub(r'[€ \t]', '', e["valor_raw"]).replace(".", "").replace(",", ".").strip()
             try:
                 val = float(val_str) if val_str else 0.0
             except ValueError:
@@ -944,6 +1047,90 @@ async def resumo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Erro: `{e}`", parse_mode="Markdown")
 
+# ─── /meses — month picker menu ──────────────────────────────────────────────
+async def meses(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🗓️ Carregando meses disponíveis...")
+    try:
+        available = get_available_months()
+        if not available:
+            await update.message.reply_text("Nenhum lançamento encontrado ainda.")
+            return
+
+        keyboard = []
+        for m in available:
+            keyboard.append([InlineKeyboardButton(
+                m["label"],
+                callback_data=f"month_{m['year']}_{m['month']:02d}"
+            )])
+
+        await update.message.reply_text(
+            "🗓️ *Seleciona um mês para ver o resumo:*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception as e:
+        logger.error(f"Meses error: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Erro: `{e}`", parse_mode="Markdown")
+
+# ─── Callback handler for month view ─────────────────────────────────────────
+async def handle_month_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        _, year_str, month_str = query.data.split("_")
+        year = int(year_str)
+        month = int(month_str)
+    except Exception:
+        await query.edit_message_text("❌ Erro ao processar o mês selecionado.")
+        return
+
+    await query.edit_message_text("📊 Carregando resumo do mês...")
+
+    try:
+        result = get_month_summary(year, month)
+        insights = result["insights"]
+        savings = result["savings"]
+
+        from datetime import date
+        dt = date(year, month, 1)
+        month_label = dt.strftime("%B %Y").capitalize()
+
+        # Build summary text
+        title = f"📊 *Resumo — {month_label}*"
+        summary = build_full_summary(insights, savings, title)
+
+        # Add back button
+        keyboard = [[InlineKeyboardButton("⬅️ Voltar aos meses", callback_data="month_back")]]
+        await query.edit_message_text(
+            summary,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception as e:
+        logger.error(f"Month callback error: {e}", exc_info=True)
+        await query.edit_message_text(f"❌ Erro ao carregar mês: `{e}`", parse_mode="Markdown")
+
+# ─── Callback: back to month list ─────────────────────────────────────────────
+async def handle_month_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        available = get_available_months()
+        keyboard = []
+        for m in available:
+            keyboard.append([InlineKeyboardButton(
+                m["label"],
+                callback_data=f"month_{m['year']}_{m['month']:02d}"
+            )])
+        await query.edit_message_text(
+            "🗓️ *Seleciona um mês para ver o resumo:*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception as e:
+        await query.edit_message_text(f"❌ Erro: `{e}`", parse_mode="Markdown")
+
 # ─── /relatorio — PDF mensal ──────────────────────────────────────────────────
 async def relatorio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📄 Gerando relatório PDF...")
@@ -984,10 +1171,13 @@ def main():
     app.add_handler(CommandHandler("resumo",     resumo))
     app.add_handler(CommandHandler("relatorio",  relatorio))
     app.add_handler(CommandHandler("categorias", categorias))
-    app.add_handler(CallbackQueryHandler(handle_delete_callback, pattern="^delrow_"))
-    app.add_handler(CallbackQueryHandler(handle_category_back, pattern="^catview_back$"))
-    app.add_handler(CallbackQueryHandler(handle_category_callback, pattern="^catview_"))
+    app.add_handler(CommandHandler("meses",      meses))
+    app.add_handler(CallbackQueryHandler(handle_delete_callback,  pattern="^delrow_"))
+    app.add_handler(CallbackQueryHandler(handle_category_back,    pattern="^catview_back$"))
+    app.add_handler(CallbackQueryHandler(handle_category_callback,pattern="^catview_"))
     app.add_handler(CallbackQueryHandler(handle_expense_callback, pattern="^exp_"))
+    app.add_handler(CallbackQueryHandler(handle_month_back,       pattern="^month_back$"))
+    app.add_handler(CallbackQueryHandler(handle_month_callback,   pattern="^month_"))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     logger.info("🤖 Bot iniciado!")
