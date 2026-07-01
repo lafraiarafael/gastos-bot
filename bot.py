@@ -439,55 +439,12 @@ def delete_lancamento_row(row_number: int):
     logger.info(f"Cleared row {row_number}")
 
 # ─── Get insights (expenses + savings) ───────────────────────────────────────
-@with_retry(max_attempts=3, delay=2)
 def get_category_insights() -> tuple[list[dict], float]:
-    """Returns (category_insights, total_cumulative_savings)"""
-    sh = gc.open_by_key(SPREADSHEET_ID)
-
-    # 1. Category insights from "Por Categoria"
-    ws_cat = sh.worksheet("Por Categoria")
-    data = ws_cat.get_all_values()
-    insights = []
-    for row in data[2:]:
-        if not row or not row[0].strip() or row[0].strip().upper() == "TOTAL":
-            continue
-        if row[0].strip() == "Poupança":
-            continue  # skip if it ever appears here
-        try:
-            def parse_currency(s):
-                s = re.sub(r'[R$€ \t]', '', s).replace(".", "").replace(",", ".").strip()
-                return float(s) if s and s not in ["#DIV/0!", "-", ""] else 0.0
-
-            categoria = row[0].strip()
-            meta  = parse_currency(row[1]) if len(row) > 1 else 0.0
-            gasto = parse_currency(row[2]) if len(row) > 2 else 0.0
-            saldo = parse_currency(row[3]) if len(row) > 3 else 0.0
-            pct_raw = row[4].strip() if len(row) > 4 else "0"
-            pct_raw = pct_raw.replace("%", "").replace(",", ".").strip()
-            pct = float(pct_raw) if pct_raw and pct_raw not in ["#DIV/0!", ""] else 0.0
-            insights.append({"categoria": categoria, "meta": meta, "gasto": gasto, "saldo": saldo, "pct": pct})
-        except Exception as e:
-            logger.warning(f"Skipping row: {row} → {e}")
-
-    # 2. Sum ALL savings from "Lançamentos" (cumulative, no month filter)
-    ws_lanc = sh.worksheet("Lançamentos")
-    all_rows = ws_lanc.get_all_values()
-    total_savings = 0.0
-
-    for row in all_rows[2:]:
-        if len(row) < 6:
-            continue
-        cat = row[3].strip() if len(row) > 3 else ""
-        if cat != "Poupança":
-            continue
-        try:
-            val_str = row[5].strip()
-            val_str = re.sub(r'[€ \t]', '', val_str).replace(".", "").replace(",", ".").strip()
-            total_savings += float(val_str) if val_str else 0.0
-        except Exception as e:
-            logger.warning(f"Savings parse error: {row} → {e}")
-
-    return insights, total_savings
+    """Returns (category_insights, total_cumulative_savings) for the CURRENT month.
+    Uses get_month_summary() so it always filters by month correctly."""
+    now = datetime.now(AMSTERDAM_TZ)
+    result = get_month_summary(now.year, now.month)
+    return result["insights"], result["savings"]
 
 # ─── Build confirmation (category only) ──────────────────────────────────────
 def build_confirmation(expense: dict, insights: list[dict], savings: float) -> str:
