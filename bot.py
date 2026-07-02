@@ -301,6 +301,9 @@ def list_expenses_by_category(categoria: str) -> list[dict]:
     current_month = now.month
     current_year = now.year
 
+    # Poupança is a cumulative fund — show ALL entries regardless of month
+    is_savings = (categoria == "Poupança")
+
     results = []
     for row in all_rows[2:]:
         if len(row) < 6:
@@ -318,15 +321,18 @@ def list_expenses_by_category(categoria: str) -> list[dict]:
                 year = 2000 + year if year < 100 else year
                 if year < 2020:
                     continue
-                if month == current_month and year == current_year:
-                    results.append({
-                        "data": date_str,
-                        "quem_pagou": row[2],
-                        "descricao": row[4],
-                        "valor_raw": row[5],
-                        "pago_com": row[6] if len(row) > 6 else "",
-                        "observacao": row[7] if len(row) > 7 else ""
-                    })
+                # For regular categories: filter by current month only
+                # For Poupança: include all months (cumulative fund)
+                if not is_savings and (month != current_month or year != current_year):
+                    continue
+                results.append({
+                    "data": date_str,
+                    "quem_pagou": row[2],
+                    "descricao": row[4],
+                    "valor_raw": row[5],
+                    "pago_com": row[6] if len(row) > 6 else "",
+                    "observacao": row[7] if len(row) > 7 else ""
+                })
         except Exception as e:
             logger.warning(f"List expenses parse error: {row} → {e}")
 
@@ -956,11 +962,14 @@ async def handle_category_callback(update: Update, context: ContextTypes.DEFAULT
     try:
         expenses = list_expenses_by_category(categoria)
 
+        is_savings_cat = (categoria == "Poupança")
+        period_label = "Acumulado" if is_savings_cat else month_name
+
         if not expenses:
-            await query.edit_message_text(f"📂 *{categoria} — {month_name}*\n\nNenhum gasto registrado este mês.", parse_mode="Markdown")
+            await query.edit_message_text(f"📂 *{categoria} — {period_label}*\n\nNenhum lançamento encontrado.", parse_mode="Markdown")
             return
 
-        lines = [f"📂 *{categoria} — {month_name}*\n"]
+        lines = [f"📂 *{categoria} — {period_label}*\n"]
         total = 0.0
         for e in expenses:
             val_str = re.sub(r'[€ \t]', '', e["valor_raw"]).replace(".", "").replace(",", ".").strip()
