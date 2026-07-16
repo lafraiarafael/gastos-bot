@@ -559,10 +559,17 @@ def build_full_summary(insights: list[dict], savings: float, title: str = None) 
         lines.append(f"🟡 Atenção (>75%): {names}")
     return "\n".join(lines)
 # ─── Generate monthly PDF report ─────────────────────────────────────────────
-def generate_monthly_pdf(insights: list[dict], savings: float) -> str:
+def generate_monthly_pdf(insights: list[dict], savings: float, year: int = None, month: int = None) -> str:
+    """Builds the PDF for the given year/month. Defaults to the current
+    Amsterdam month when year/month aren't provided (used by the automatic
+    end-of-month job)."""
     now = datetime.now(AMSTERDAM_TZ)
-    month_name = now.strftime("%B").capitalize()
-    filepath = f"/tmp/relatorio_{now.strftime('%Y_%m')}.pdf"
+    if year is None or month is None:
+        year, month = now.year, now.month
+    from datetime import date
+    target_date = date(year, month, 1)
+    month_name = target_date.strftime("%B").capitalize()
+    filepath = f"/tmp/relatorio_{year}_{month:02d}.pdf"
     doc = SimpleDocTemplate(filepath, pagesize=A4,
                              topMargin=1.5*cm, bottomMargin=1.5*cm,
                              leftMargin=1.5*cm, rightMargin=1.5*cm)
@@ -570,7 +577,7 @@ def generate_monthly_pdf(insights: list[dict], savings: float) -> str:
     title_style = ParagraphStyle("TitleCustom", parent=styles["Title"], fontSize=20, alignment=TA_CENTER, spaceAfter=4)
     subtitle_style = ParagraphStyle("Subtitle", parent=styles["Normal"], fontSize=12, alignment=TA_CENTER, textColor=colors.grey, spaceAfter=20)
     elements = []
-    elements.append(Paragraph(f"Relatório de Gastos — {month_name} {now.year}", title_style))
+    elements.append(Paragraph(f"Relatório de Gastos — {month_name} {year}", title_style))
     elements.append(Paragraph("Rafa &amp; Renata", subtitle_style))
     sorted_cats = sorted(insights, key=lambda x: x["gasto"], reverse=True)
     # ── Pie chart: distribuição de gastos por categoria ──
@@ -980,7 +987,7 @@ async def comandos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/meses` — resumo de qualquer mês anterior\n"
         "`/metas` — mostra as metas atuais de cada categoria\n"
         "`/editarmetas` — edita a meta de uma categoria direto pelo Telegram\n"
-        "`/relatorio` — gera um PDF do mês atual, com gráfico e tabela\n"
+        "`/relatorio` — escolhe o mês e gera o PDF (gráfico + tabela) daquele mês\n"
         "`/comandos` — mostra esta lista\n\n"
         "─────────────\n"
         "⚙️ *Automático*\n\n"
@@ -1221,17 +1228,54 @@ async def handle_month_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         await query.edit_message_text(f"❌ Erro: `{e}`", parse_mode="Markdown")
-# ─── /relatorio — PDF mensal ──────────────────────────────────────────────────
+# ─── /relatorio — escolhe o mês, depois gera o PDF ───────────────────────────
 async def relatorio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📄 Gerando relatório PDF...")
+    await update.message.reply_text("🗓️ Carregando meses disponíveis...")
     try:
-        insights, savings = await asyncio.to_thread(get_category_insights)
-        filepath = await asyncio.to_thread(generate_monthly_pdf, insights, savings)
+        available = await asyncio.to_thread(get_available_months)
+        if not available:
+            await update.message.reply_text("Nenhum lançamento encontrado ainda.")
+            return
+        keyboard = []
+        for m in available:
+            keyboard.append([InlineKeyboardButton(
+                m["label"],
+                callback_data=f"pdfmonth_{m['year']}_{m['month']:02d}"
+            )])
+        await update.message.reply_text(
+            "📄 *Selecione o mês do relatório:*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception as e:
+        logger.error(f"Relatorio menu error: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Erro: `{e}`", parse_mode="Markdown")
+# ─── Callback handler: gera o PDF do mês escolhido ───────────────────────────
+async def handle_pdf_month_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, year_str, month_str = query.data.split("_")
+        year = int(year_str)
+        month = int(month_str)
+    except Exception:
+        await query.edit_message_text("❌ Erro ao processar o mês selecionado.")
+        return
+    from datetime import date
+    month_label = date(year, month, 1).strftime("%B %Y").capitalize()
+    await query.edit_message_text(f"📄 Gerando relatório de {month_label}...")
+    try:
+        result = await asyncio.to_thread(get_month_summary, year, month)
+        filepath = await asyncio.to_thread(generate_monthly_pdf, result["insights"], result["savings"], year, month)
         with open(filepath, "rb") as f:
-            await update.message.reply_document(document=f, filename=os.path.basename(filepath))
+            await context.bot.send_document(
+                chat_id=query.message.chat_id, document=f, filename=os.path.basename(filepath)
+            )
     except Exception as e:
         logger.error(f"PDF error: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ Erro ao gerar PDF: `{e}`", parse_mode="Markdown")
+        await context.bot.send_message(
+            chat_id=query.message.chat_id, text=f"❌ Erro ao gerar PDF: `{e}`", parse_mode="Markdown"
+        )
 # ─── Monthly PDF job (last day of month, 20h Amsterdam) ──────────────────────
 async def send_monthly_pdf(context) -> None:
     chat_id = context.job.data
@@ -1268,6 +1312,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_expense_callback, pattern="^exp_"))
     app.add_handler(CallbackQueryHandler(handle_month_back,       pattern="^month_back$"))
     app.add_handler(CallbackQueryHandler(handle_editmeta_callback, pattern="^editmeta_"))
+    app.add_handler(CallbackQueryHandler(handle_pdf_month_callback, pattern="^pdfmonth_"))
     app.add_handler(CallbackQueryHandler(handle_month_callback,   pattern="^month_"))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
