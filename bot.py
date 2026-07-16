@@ -358,23 +358,14 @@ def get_available_months() -> list[dict]:
 # ─── Summarize expenses for a specific month ──────────────────────────────────
 @with_retry(max_attempts=3, delay=2)
 def get_month_summary(year: int, month: int) -> dict:
-    """Read Lançamentos and aggregate by category for a specific month."""
+    """Read Lançamentos and aggregate by category for a specific month.
+    Goals (metas) are pulled from the historical snapshot for that exact
+    month when one exists, so reports for past months reflect the goals
+    that were actually active back then — not today's goals."""
     sh = get_spreadsheet()
     ws_lanc = sh.worksheet("Lançamentos")
-    ws_metas = sh.worksheet("Metas")
     all_rows = ws_lanc.get_all_values()
-    meta_rows = ws_metas.get_all_values()
-    # Read metas from Metas tab
-    metas = {}
-    for row in meta_rows[2:]:  # skip title + total row
-        if len(row) < 2 or not row[0].strip():
-            continue
-        cat = row[0].strip()
-        val_str = re.sub(r'[€ \-]', '', row[1]).replace(".", "").replace(",", ".").strip()
-        try:
-            metas[cat] = float(val_str) if val_str and val_str not in ["-", ""] else 0.0
-        except ValueError:
-            metas[cat] = 0.0
+    metas = get_metas_for_month(year, month)
     # Aggregate gastos by category for target month ONLY
     # Poupança is cumulative (all time), so we sum it separately without month filter
     gastos = {}
@@ -448,9 +439,80 @@ def parse_valor_input(text: str) -> float:
     elif "," in raw:
         raw = raw.replace(",", ".")
     return float(raw)
+def parse_metas_sheet(meta_rows: list) -> dict:
+    """Parses the Metas tab's raw rows into a {categoria: valor} dict."""
+    metas = {}
+    for row in meta_rows[2:]:  # skip title + header row
+        if len(row) < 2 or not row[0].strip():
+            continue
+        cat = row[0].strip()
+        val_str = re.sub(r'[€ \-]', '', row[1]).replace(".", "").replace(",", ".").strip()
+        try:
+            metas[cat] = float(val_str) if val_str and val_str not in ["-", ""] else 0.0
+        except ValueError:
+            metas[cat] = 0.0
+    return metas
+# ─── Metas históricas (metas por mês, pra relatórios de meses passados) ─────
+def get_metas_historico_ws():
+    """Returns the Metas_Historico worksheet, creating it (with header) if
+    it doesn't exist yet."""
+    sh = get_spreadsheet()
+    try:
+        return sh.worksheet("Metas_Historico")
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title="Metas_Historico", rows=1000, cols=3)
+        ws.update("A1:C1", [["AnoMes", "Categoria", "Valor"]], value_input_option='USER_ENTERED')
+        return ws
+@with_retry(max_attempts=3, delay=2)
+def snapshot_metas_for_month(year: int, month: int):
+    """Freezes the CURRENT live values from the Metas tab as the record for
+    the given year/month in Metas_Historico (overwrites any existing
+    snapshot for that same month). Called daily for the current month and
+    right after any /editarmetas edit, so a completed month keeps whatever
+    goals were active during it even if goals change later."""
+    sh = get_spreadsheet()
+    ws_metas = sh.worksheet("Metas")
+    current_metas = parse_metas_sheet(ws_metas.get_all_values())
+    ws_hist = get_metas_historico_ws()
+    all_rows = ws_hist.get_all_values()
+    ano_mes = f"{year}-{month:02d}"
+    kept = [row for row in all_rows[1:] if len(row) > 0 and row[0].strip() != ano_mes]
+    new_rows = kept + [[ano_mes, cat, format_eur(val)] for cat, val in current_metas.items()]
+    ws_hist.clear()
+    ws_hist.update("A1", [["AnoMes", "Categoria", "Valor"]] + new_rows, value_input_option='USER_ENTERED')
+    logger.info(f"Metas snapshot salvo para {ano_mes} ({len(current_metas)} categorias)")
+@with_retry(max_attempts=3, delay=2)
+def get_metas_for_month(year: int, month: int) -> dict:
+    """Returns {categoria: valor} recorded for the given month. Falls back
+    to the CURRENT Metas tab if no snapshot exists yet for that month (e.g.
+    months from before this feature existed, where there's no way to
+    recover what the goals used to be)."""
+    sh = get_spreadsheet()
+    ano_mes = f"{year}-{month:02d}"
+    try:
+        ws_hist = sh.worksheet("Metas_Historico")
+        hist_rows = ws_hist.get_all_values()
+        result = {}
+        for row in hist_rows[1:]:
+            if len(row) < 3 or row[0].strip() != ano_mes:
+                continue
+            cat = row[1].strip()
+            val_str = re.sub(r'[€ \-]', '', row[2]).replace(".", "").replace(",", ".").strip()
+            try:
+                result[cat] = float(val_str) if val_str else 0.0
+            except ValueError:
+                result[cat] = 0.0
+        if result:
+            return result
+    except gspread.WorksheetNotFound:
+        pass
+    ws_metas = sh.worksheet("Metas")
+    return parse_metas_sheet(ws_metas.get_all_values())
 @with_retry(max_attempts=3, delay=2)
 def set_meta(categoria: str, valor: float) -> int:
-    """Writes/updates the goal value for a category in the Metas tab."""
+    """Writes/updates the goal value for a category in the Metas tab, and
+    refreshes the current month's historical snapshot so the change is
+    reflected immediately in this month's reports."""
     sh = get_spreadsheet()
     ws = sh.worksheet("Metas")
     all_vals = ws.get_all_values()
@@ -472,6 +534,11 @@ def set_meta(categoria: str, valor: float) -> int:
                 break
         ws.update(f"A{target_row}:B{target_row}", [[categoria, formatted]], value_input_option='USER_ENTERED')
     logger.info(f"Meta updated: {categoria} = {formatted} (row {target_row})")
+    now = datetime.now(AMSTERDAM_TZ)
+    try:
+        snapshot_metas_for_month(now.year, now.month)
+    except Exception as e:
+        logger.warning(f"Could not refresh metas snapshot after edit: {e}")
     return target_row
 # ─── Get insights (expenses + savings) ───────────────────────────────────────
 def get_category_insights() -> tuple[list[dict], float]:
@@ -994,7 +1061,8 @@ async def comandos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✅ Todo lançamento pede confirmação antes de salvar\n"
         "🟡 Alerta automático quando uma categoria passa de 90% da meta\n"
         "🗓️ Toda segunda-feira às 8h: resumo semanal automático\n"
-        "🗓️ Todo fim de mês às 20h: relatório PDF automático"
+        "🗓️ Todo fim de mês às 20h: relatório PDF automático\n"
+        "📌 As metas de cada mês ficam registradas — mudar a meta hoje não altera relatórios de meses já passados"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 # ─── /categorias — menu to pick a category and see its expenses ─────────────
@@ -1288,8 +1356,15 @@ async def send_monthly_pdf(context) -> None:
     except Exception as e:
         logger.error(f"Monthly PDF job error: {e}", exc_info=True)
 async def check_last_day_of_month(context) -> None:
-    """Runs daily; sends the PDF only if today is the last day of the month."""
+    """Runs daily. Always refreshes the metas snapshot for the CURRENT month
+    (so it stays in sync with any goal changes made during the month, and
+    ends up frozen once the month is over) — and additionally sends the PDF
+    if today happens to be the last day of the month."""
     now = datetime.now(AMSTERDAM_TZ)
+    try:
+        await asyncio.to_thread(snapshot_metas_for_month, now.year, now.month)
+    except Exception as e:
+        logger.error(f"Metas snapshot job error: {e}", exc_info=True)
     tomorrow = now.replace(hour=0, minute=0, second=0, microsecond=0)
     from datetime import timedelta
     if (tomorrow + timedelta(days=1)).month != now.month:
