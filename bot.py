@@ -74,6 +74,8 @@ def store_pending(expense: dict) -> str:
     key = str(_pending_counter % 100000)
     PENDING_EXPENSES[key] = expense
     return key
+# In-memory state for "editar meta" flow (keyed by chat_id → categoria aguardando valor)
+PENDING_META_EDITS = {}
 CATEGORIES = [
     "Alimentação", "Transporte", "Moradia", "Utilidades",
     "Saúde", "Lazer", "Educação", "Roupas",
@@ -427,6 +429,50 @@ def delete_lancamento_row(row_number: int):
     ws = sh.worksheet("Lançamentos")
     ws.batch_clear([f"A{row_number}:H{row_number}"])
     logger.info(f"Cleared row {row_number}")
+# ─── Meta editing helpers ─────────────────────────────────────────────────────
+def format_eur(valor: float) -> str:
+    """Formats a float as '€ 1.234,56' (European style), matching how the
+    Metas sheet already stores values."""
+    s = f"{valor:,.2f}"                      # "1,234.56" (US style)
+    s = s.replace(",", "X").replace(".", ",").replace("X", ".")  # "1.234,56"
+    return f"€ {s}"
+def parse_valor_input(text: str) -> float:
+    """Extracts a numeric value from free text, accepting both '250,50' and
+    '250.50' / '1.250,50' formats. Raises ValueError if no number is found."""
+    match = re.search(r'\d+(?:[.,]\d+)*', text)
+    if not match:
+        raise ValueError(f"Nenhum número encontrado em: {text!r}")
+    raw = match.group(0)
+    if "," in raw and "." in raw:
+        raw = raw.replace(".", "").replace(",", ".")
+    elif "," in raw:
+        raw = raw.replace(",", ".")
+    return float(raw)
+@with_retry(max_attempts=3, delay=2)
+def set_meta(categoria: str, valor: float) -> int:
+    """Writes/updates the goal value for a category in the Metas tab."""
+    sh = get_spreadsheet()
+    ws = sh.worksheet("Metas")
+    all_vals = ws.get_all_values()
+    target_row = None
+    for idx, row in enumerate(all_vals):
+        if idx < 2:  # skip title + total row
+            continue
+        if len(row) > 0 and row[0].strip().lower() == categoria.strip().lower():
+            target_row = idx + 1
+            break
+    formatted = format_eur(valor)
+    if target_row:
+        ws.update(f"B{target_row}", [[formatted]], value_input_option='USER_ENTERED')
+    else:
+        target_row = len(all_vals) + 1
+        for idx in range(len(all_vals) - 1, 1, -1):
+            if any(cell.strip() for cell in all_vals[idx]):
+                target_row = idx + 2
+                break
+        ws.update(f"A{target_row}:B{target_row}", [[categoria, formatted]], value_input_option='USER_ENTERED')
+    logger.info(f"Meta updated: {categoria} = {formatted} (row {target_row})")
+    return target_row
 # ─── Get insights (expenses + savings) ───────────────────────────────────────
 def get_category_insights() -> tuple[list[dict], float]:
     """Returns (category_insights, total_cumulative_savings) for the CURRENT month.
@@ -798,6 +844,34 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── Text handler ─────────────────────────────────────────────────────────────
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
+    chat_id = update.effective_chat.id
+    # ── If we're waiting for a new meta value, this message is the answer ──
+    if chat_id in PENDING_META_EDITS:
+        categoria_pendente = PENDING_META_EDITS[chat_id]
+        if text.strip().lower() in ["cancelar", "cancel"]:
+            PENDING_META_EDITS.pop(chat_id, None)
+            await update.message.reply_text("❌ Edição de meta cancelada.")
+            return
+        try:
+            valor = parse_valor_input(text)
+        except ValueError:
+            await update.message.reply_text(
+                "⚠️ Não entendi o valor. Manda só o número (ex: `250` ou `250,50`), "
+                "ou \"cancelar\" pra desistir.",
+                parse_mode="Markdown"
+            )
+            return
+        PENDING_META_EDITS.pop(chat_id, None)
+        try:
+            await asyncio.to_thread(set_meta, categoria_pendente, valor)
+            await update.message.reply_text(
+                f"✅ Meta de {cat_emoji(categoria_pendente)} *{categoria_pendente}* atualizada para *€ {valor:.2f}*.",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.error(f"Set meta error: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Erro ao salvar meta: `{e}`", parse_mode="Markdown")
+        return
     if text.startswith("/"):
         return
     sender = identify_sender(update)
@@ -905,6 +979,7 @@ async def comandos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/categorias` — menu pra ver os lançamentos de uma categoria específica\n"
         "`/meses` — resumo de qualquer mês anterior\n"
         "`/metas` — mostra as metas atuais de cada categoria\n"
+        "`/editarmetas` — edita a meta de uma categoria direto pelo Telegram\n"
         "`/relatorio` — gera um PDF do mês atual, com gráfico e tabela\n"
         "`/comandos` — mostra esta lista\n\n"
         "─────────────\n"
@@ -912,8 +987,7 @@ async def comandos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✅ Todo lançamento pede confirmação antes de salvar\n"
         "🟡 Alerta automático quando uma categoria passa de 90% da meta\n"
         "🗓️ Toda segunda-feira às 8h: resumo semanal automático\n"
-        "🗓️ Todo fim de mês às 20h: relatório PDF automático\n\n"
-        "_Para mudar as metas, edita a aba **Metas** direto na planilha._"
+        "🗓️ Todo fim de mês às 20h: relatório PDF automático"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 # ─── /categorias — menu to pick a category and see its expenses ─────────────
@@ -1021,12 +1095,59 @@ async def metas(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"{cat_emoji(cat['categoria'])} {cat['categoria']}  —  €{cat['gasto']:.2f}")
         lines.append("")
         lines.append(f"💰 *Total orçamento: €{total_meta:.2f}*")
-        lines.append("")
-        lines.append("_Para alterar as metas, edita a aba **Metas** na planilha._")
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        keyboard = [[InlineKeyboardButton("✏️ Editar metas", callback_data="editmeta_menu")]]
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard)
+        )
     except Exception as e:
         logger.error(f"Metas error: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Erro: `{e}`", parse_mode="Markdown")
+# ─── /editarmetas — editar metas direto pelo Telegram ────────────────────────
+def build_editmeta_keyboard() -> list:
+    keyboard = []
+    row = []
+    for cat in CATEGORIES:
+        if cat == "Poupança":
+            continue
+        row.append(InlineKeyboardButton(f"{cat_emoji(cat)} {cat}", callback_data=f"editmeta_cat_{cat}"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("❌ Cancelar", callback_data="editmeta_cancel")])
+    return keyboard
+async def editarmetas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "✏️ *Editar meta — escolha a categoria:*",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(build_editmeta_keyboard())
+    )
+# ─── Callback handler for meta editing flow ──────────────────────────────────
+async def handle_editmeta_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    if query.data == "editmeta_cancel":
+        PENDING_META_EDITS.pop(chat_id, None)
+        await query.edit_message_text("❌ Cancelado.")
+        return
+    if query.data == "editmeta_menu":
+        await query.edit_message_text(
+            "✏️ *Editar meta — escolha a categoria:*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(build_editmeta_keyboard())
+        )
+        return
+    if query.data.startswith("editmeta_cat_"):
+        categoria = query.data.replace("editmeta_cat_", "")
+        PENDING_META_EDITS[chat_id] = categoria
+        await query.edit_message_text(
+            f"✏️ Manda o novo valor da meta de {cat_emoji(categoria)} *{categoria}* "
+            f"(ex: `250` ou `250,50`).\n\nManda \"cancelar\" pra desistir.",
+            parse_mode="Markdown"
+        )
+        return
 # ─── /meses — month picker menu ──────────────────────────────────────────────
 async def meses(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🗓️ Carregando meses disponíveis...")
@@ -1139,12 +1260,14 @@ def main():
     app.add_handler(CommandHandler("categorias", categorias))
     app.add_handler(CommandHandler("meses",      meses))
     app.add_handler(CommandHandler("metas",      metas))
+    app.add_handler(CommandHandler("editarmetas", editarmetas))
     app.add_handler(CommandHandler("comandos",   comandos))
     app.add_handler(CallbackQueryHandler(handle_delete_callback,  pattern="^delrow_"))
     app.add_handler(CallbackQueryHandler(handle_category_back,    pattern="^catview_back$"))
     app.add_handler(CallbackQueryHandler(handle_category_callback,pattern="^catview_"))
     app.add_handler(CallbackQueryHandler(handle_expense_callback, pattern="^exp_"))
     app.add_handler(CallbackQueryHandler(handle_month_back,       pattern="^month_back$"))
+    app.add_handler(CallbackQueryHandler(handle_editmeta_callback, pattern="^editmeta_"))
     app.add_handler(CallbackQueryHandler(handle_month_callback,   pattern="^month_"))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
