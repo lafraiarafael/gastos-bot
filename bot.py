@@ -3,6 +3,7 @@ import json
 import logging
 import tempfile
 import re
+import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -16,12 +17,9 @@ from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER
-
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -29,15 +27,24 @@ SCOPES = [
 creds_json = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
 creds = Credentials.from_service_account_info(creds_json, scopes=SCOPES)
 gc = gspread.authorize(creds)
-
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "1MZeWj4emurdqv4YG1eusCIXop1rI7qru3UHHIcqqMaA")
 AMSTERDAM_TZ = ZoneInfo("Europe/Amsterdam")
-
+# ─── Cached spreadsheet handle ────────────────────────────────────────────────
+# Reopening the spreadsheet by key on every single call costs an extra Drive
+# API round-trip each time. Cache the handle after the first successful open.
+_spreadsheet = None
+def get_spreadsheet():
+    global _spreadsheet
+    if _spreadsheet is None:
+        _spreadsheet = gc.open_by_key(SPREADSHEET_ID)
+    return _spreadsheet
 # ─── Retry decorator for Google Sheets API calls ─────────────────────────────
 import time
-
 def with_retry(max_attempts=3, delay=2):
-    """Retry decorator for Google API calls that may fail with 503."""
+    """Retry decorator for Google API calls that may fail with 503.
+    NOTE: this uses a blocking time.sleep(), which is fine as long as the
+    decorated function is only ever invoked via asyncio.to_thread() from
+    async handlers (see call sites below) — never awaited directly."""
     def decorator(func):
         def wrapper(*args, **kwargs):
             last_error = None
@@ -56,24 +63,20 @@ def with_retry(max_attempts=3, delay=2):
             raise last_error
         return wrapper
     return decorator
-
 # In-memory cache for expenses pending confirmation (keyed by a short id)
 PENDING_EXPENSES = {}
 _pending_counter = 0
-
 def store_pending(expense: dict) -> str:
     global _pending_counter
     _pending_counter += 1
     key = str(_pending_counter % 100000)
     PENDING_EXPENSES[key] = expense
     return key
-
 CATEGORIES = [
     "Alimentação", "Transporte", "Moradia", "Utilidades",
     "Saúde", "Lazer", "Educação", "Roupas",
     "Farmácia", "Impostos", "Outros", "Poupança"
 ]
-
 # ─── Identify sender ──────────────────────────────────────────────────────────
 def identify_sender(update: Update) -> str:
     user = update.effective_user
@@ -83,7 +86,6 @@ def identify_sender(update: Update) -> str:
     if any(w in combined for w in ["rafael", "rafa"]):
         return "Rafa"
     return (user.first_name or "Desconhecido").capitalize()
-
 # ─── Progress bar ─────────────────────────────────────────────────────────────
 def progress_bar(pct: float) -> str:
     pct_capped = min(pct, 100)
@@ -91,35 +93,30 @@ def progress_bar(pct: float) -> str:
     empty = 10 - filled
     emoji = "🔴" if pct >= 100 else "🟡" if pct >= 75 else "🟢"
     return f"{'█' * filled}{'░' * empty} {pct:.0f}% {emoji}"
-
 # ─── Transcribe ───────────────────────────────────────────────────────────────
 async def transcribe_audio(file_path: str) -> str:
-    with open(file_path, "rb") as f:
-        transcript = openai_client.audio.transcriptions.create(
-            model="whisper-1", file=f, language="pt"
-        )
-    return transcript.text
-
+    def _sync_transcribe():
+        with open(file_path, "rb") as f:
+            transcript = openai_client.audio.transcriptions.create(
+                model="whisper-1", file=f, language="pt"
+            )
+        return transcript.text
+    return await asyncio.to_thread(_sync_transcribe)
 # ─── Parse expense ────────────────────────────────────────────────────────────
 def parse_expense(text: str, sender: str) -> dict:
     today = datetime.now(AMSTERDAM_TZ).strftime("%d/%m/%y")
     week_num = datetime.now(AMSTERDAM_TZ).isocalendar()[1]
     cats = ", ".join(CATEGORIES)
-
     summary_keywords = ["resumo", "summary", "relatório", "relatorio", "como estamos", "situação", "situacao"]
     if any(kw in text.lower() for kw in summary_keywords):
         return {"is_summary_request": True}
-
     delete_keywords = ["remove", "remover", "apaga", "apagar", "deleta", "deletar", "exclui", "excluir", "cancela esse lançamento", "cancelar lançamento", "errei", "lancei errado", "lancei por engano"]
     if any(kw in text.lower() for kw in delete_keywords):
         return {"is_delete_request": True, "delete_query": text}
-
     prompt = f"""Você é um assistente de controle financeiro de casal que mora na Holanda.
 A moeda usada é o Euro (€).
-
 O texto abaixo foi dito por **{sender}** e descreve um gasto ou poupança.
 Hoje: {today} | Semana ISO: {week_num}
-
 Extraia e responda APENAS com JSON válido (sem markdown, sem explicação):
 {{
   "is_summary_request": false,
@@ -132,9 +129,7 @@ Extraia e responda APENAS com JSON válido (sem markdown, sem explicação):
   "pago_com": "<Débito ou Crédito>",
   "observacao": "<texto livre ou string vazia>"
 }}
-
 Categorias válidas: {cats}
-
 Regras:
 - Se mencionar poupança, guardar, economizar, reservar, depositar → categoria = "Poupança", valor POSITIVO
 - Se mencionar retirar, tirar, sacar, usar da poupança, pegar da poupança → categoria = "Poupança", valor NEGATIVO (ex: -5.00)
@@ -143,10 +138,8 @@ Regras:
 - valor: número puro sem símbolo (ex: 32.50 ou -5.00 para retiradas da poupança)
 - data: hoje se não mencionada ({today})
 - descricao: nome do estabelecimento ou produto
-
 Texto: "{text}"
 """
-
     resp = openai_client.chat.completions.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
@@ -154,16 +147,13 @@ Texto: "{text}"
         response_format={"type": "json_object"}
     )
     result = json.loads(resp.choices[0].message.content)
-
     # ── Validation (auditoria de erros silenciosos) ──
     if not result.get("is_summary_request") and not result.get("is_delete_request"):
         warnings = []
-
         if result.get("categoria") not in CATEGORIES:
             warnings.append(f"⚠️ Categoria \"{result.get('categoria')}\" não existe na lista oficial.")
             result["categoria"] = "Outros"
             warnings.append("Usei \"Outros\" como categoria padrão.")
-
         try:
             valor = float(result.get("valor", 0))
             if valor == 0:
@@ -172,23 +162,18 @@ Texto: "{text}"
         except (ValueError, TypeError):
             warnings.append(f"⚠️ Valor \"{result.get('valor')}\" inválido, ficou 0.")
             result["valor"] = 0.0
-
         if result.get("quem_pagou") not in ["Rafa", "Renata"]:
             warnings.append(f"⚠️ Pessoa \"{result.get('quem_pagou')}\" não reconhecida, usei \"{sender}\".")
             result["quem_pagou"] = sender
-
         if warnings:
             result["_warnings"] = warnings
-
     return result
-
 # ─── Insert lancamento ────────────────────────────────────────────────────────
 @with_retry(max_attempts=3, delay=2)
 def insert_lancamento(expense: dict) -> int:
-    sh = gc.open_by_key(SPREADSHEET_ID)
+    sh = get_spreadsheet()
     ws = sh.worksheet("Lançamentos")
     all_vals = ws.get_all_values()
-
     target_row = None
     for idx, row in enumerate(all_vals):
         if idx < 2:
@@ -197,12 +182,10 @@ def insert_lancamento(expense: dict) -> int:
         who_cell   = row[2].strip() if len(row) > 2 else ""
         cat_cell   = row[3].strip() if len(row) > 3 else ""
         value_cell = row[5].strip() if len(row) > 5 else ""
-
         if date_cell and who_cell and not cat_cell and not value_cell:
             if who_cell.lower() == expense["quem_pagou"].lower():
                 target_row = idx + 1
                 break
-
     if target_row is None:
         for idx in range(len(all_vals) - 1, 1, -1):
             if any(cell.strip() for cell in all_vals[idx]):
@@ -210,34 +193,27 @@ def insert_lancamento(expense: dict) -> int:
                 break
         if target_row is None:
             target_row = len(all_vals) + 1
-
     valor_float = float(expense["valor"])
-
     row_data = [
         expense["data"], expense["semana"], expense["quem_pagou"],
         expense["categoria"], expense.get("descricao", ""),
         valor_float, expense["pago_com"], expense.get("observacao", "")
     ]
-
     row_vals = all_vals[target_row - 1] if target_row <= len(all_vals) else []
     date_existing = row_vals[0].strip() if row_vals else ""
-
     if date_existing:
         ws.update(f"A{target_row}:H{target_row}", [row_data], value_input_option='USER_ENTERED')
     else:
         ws.insert_row(row_data, target_row, value_input_option='USER_ENTERED')
-
     logger.info(f"Row {target_row}: {row_data}")
     return target_row
-
 # ─── Find rows matching a delete request ─────────────────────────────────────
 @with_retry(max_attempts=3, delay=2)
 def find_matching_lancamentos(query: str, sender: str, max_results: int = 5) -> list[dict]:
     """Search the last ~60 days of Lançamentos for rows matching the query text."""
-    sh = gc.open_by_key(SPREADSHEET_ID)
+    sh = get_spreadsheet()
     ws = sh.worksheet("Lançamentos")
     all_rows = ws.get_all_values()
-
     candidates = []
     for idx, row in enumerate(all_rows):
         if idx < 2:
@@ -256,26 +232,20 @@ def find_matching_lancamentos(query: str, sender: str, max_results: int = 5) -> 
             "valor_raw": val_cell,
             "observacao": row[7] if len(row) > 7 else ""
         })
-
     if not candidates:
         return []
-
     # Use GPT to rank/match candidates against the query (most recent 40 rows considered)
     recent = candidates[-40:]
     candidates_str = "\n".join([
         f"{c['row_number']}: {c['data']} | {c['quem_pagou']} | {c['categoria']} | {c['descricao']} | {c['valor_raw']} | {c['observacao']}"
         for c in recent
     ])
-
     prompt = f"""O usuário {sender} quer apagar um lançamento de despesa. Aqui está o pedido dele:
 "{query}"
-
 Aqui está a lista de lançamentos recentes (formato: row_number: data | quem_pagou | categoria | descrição | valor | observação):
 {candidates_str}
-
 Responda APENAS com um JSON contendo os números das linhas (row_number) que melhor correspondem ao pedido, ordenados do mais provável ao menos provável, no máximo {max_results}:
 {{"matches": [<row_number>, ...]}}
-
 Se nenhuma linha corresponder bem, retorne {{"matches": []}}.
 """
     resp = openai_client.chat.completions.create(
@@ -286,24 +256,19 @@ Se nenhuma linha corresponder bem, retorne {{"matches": []}}.
     )
     result = json.loads(resp.choices[0].message.content)
     matched_rows = result.get("matches", [])
-
     by_row = {c["row_number"]: c for c in candidates}
     return [by_row[r] for r in matched_rows if r in by_row][:max_results]
-
 # ─── List expenses by category (current month) ──────────────────────────────
 @with_retry(max_attempts=3, delay=2)
 def list_expenses_by_category(categoria: str) -> list[dict]:
-    sh = gc.open_by_key(SPREADSHEET_ID)
+    sh = get_spreadsheet()
     ws = sh.worksheet("Lançamentos")
     all_rows = ws.get_all_values()
-
     now = datetime.now(AMSTERDAM_TZ)
     current_month = now.month
     current_year = now.year
-
     # Poupança is a cumulative fund — show ALL entries regardless of month
     is_savings = (categoria == "Poupança")
-
     results = []
     for row in all_rows[2:]:
         if len(row) < 6:
@@ -335,17 +300,14 @@ def list_expenses_by_category(categoria: str) -> list[dict]:
                 })
         except Exception as e:
             logger.warning(f"List expenses parse error: {row} → {e}")
-
     return results
-
 # ─── Get all months that have lancamentos ─────────────────────────────────────
 @with_retry(max_attempts=3, delay=2)
 def get_available_months() -> list[dict]:
     """Returns list of {year, month, label} for all months that have entries."""
-    sh = gc.open_by_key(SPREADSHEET_ID)
+    sh = get_spreadsheet()
     ws = sh.worksheet("Lançamentos")
     all_rows = ws.get_all_values()
-
     months_seen = {}
     for row in all_rows[2:]:
         if len(row) < 4 or not row[0].strip() or not row[3].strip():
@@ -365,7 +327,6 @@ def get_available_months() -> list[dict]:
                     months_seen[key] = True
         except Exception:
             continue
-
     result = []
     for (year, month) in sorted(months_seen.keys(), reverse=True):
         from datetime import date
@@ -373,17 +334,15 @@ def get_available_months() -> list[dict]:
         label = dt.strftime("%B %Y").capitalize()
         result.append({"year": year, "month": month, "label": label})
     return result
-
 # ─── Summarize expenses for a specific month ──────────────────────────────────
 @with_retry(max_attempts=3, delay=2)
 def get_month_summary(year: int, month: int) -> dict:
     """Read Lançamentos and aggregate by category for a specific month."""
-    sh = gc.open_by_key(SPREADSHEET_ID)
+    sh = get_spreadsheet()
     ws_lanc = sh.worksheet("Lançamentos")
     ws_metas = sh.worksheet("Metas")
     all_rows = ws_lanc.get_all_values()
     meta_rows = ws_metas.get_all_values()
-
     # Read metas from Metas tab
     metas = {}
     for row in meta_rows[2:]:  # skip title + total row
@@ -395,7 +354,6 @@ def get_month_summary(year: int, month: int) -> dict:
             metas[cat] = float(val_str) if val_str and val_str not in ["-", ""] else 0.0
         except ValueError:
             metas[cat] = 0.0
-
     # Aggregate gastos by category for target month ONLY
     # Poupança is cumulative (all time), so we sum it separately without month filter
     gastos = {}
@@ -411,12 +369,10 @@ def get_month_summary(year: int, month: int) -> dict:
         try:
             val_clean = re.sub(r'[€ ]', '', val_str).replace(".", "").replace(",", ".").strip()
             valor = float(val_clean) if val_clean else 0.0
-
             # Poupança: sum ALL entries regardless of month (cumulative fund)
             if cat == "Poupança":
                 savings += valor
                 continue
-
             # Regular expenses: filter by target month/year only
             parts = date_str.split("/")
             if len(parts) != 3:
@@ -431,7 +387,6 @@ def get_month_summary(year: int, month: int) -> dict:
             gastos[cat] = gastos.get(cat, 0.0) + valor
         except Exception:
             continue
-
     # Build insights list matching format used in build_full_summary
     insights = []
     all_cats = set(list(metas.keys()) + list(gastos.keys()))
@@ -445,16 +400,14 @@ def get_month_summary(year: int, month: int) -> dict:
         saldo = meta - gasto
         pct = (gasto / meta * 100) if meta > 0 else 0.0
         insights.append({"categoria": cat, "meta": meta, "gasto": gasto, "saldo": saldo, "pct": pct})
-
     return {"insights": insights, "savings": savings}
-
 # ─── Delete a specific row (clear its contents) ──────────────────────────────
+@with_retry(max_attempts=3, delay=2)
 def delete_lancamento_row(row_number: int):
-    sh = gc.open_by_key(SPREADSHEET_ID)
+    sh = get_spreadsheet()
     ws = sh.worksheet("Lançamentos")
     ws.batch_clear([f"A{row_number}:H{row_number}"])
     logger.info(f"Cleared row {row_number}")
-
 # ─── Get insights (expenses + savings) ───────────────────────────────────────
 def get_category_insights() -> tuple[list[dict], float]:
     """Returns (category_insights, total_cumulative_savings) for the CURRENT month.
@@ -462,16 +415,13 @@ def get_category_insights() -> tuple[list[dict], float]:
     now = datetime.now(AMSTERDAM_TZ)
     result = get_month_summary(now.year, now.month)
     return result["insights"], result["savings"]
-
 # ─── Build confirmation (category only) ──────────────────────────────────────
 def build_confirmation(expense: dict, insights: list[dict], savings: float) -> str:
     month_name = datetime.now(AMSTERDAM_TZ).strftime("%B").capitalize()
     is_savings = expense["categoria"] == "Poupança"
-
     lines = []
     lines.append(f"✅ *Lançado com sucesso!*\n")
     lines.append(f"👤 *{expense['quem_pagou']}*")
-
     if is_savings:
         valor = float(expense['valor'])
         is_withdrawal = valor < 0
@@ -488,7 +438,6 @@ def build_confirmation(expense: dict, insights: list[dict], savings: float) -> s
         lines.append(f"💶 *€ {float(expense['valor']):.2f}*  ({expense['pago_com']})")
         if expense.get("observacao"):
             lines.append(f"💬 _{expense['observacao']}_")
-
         this_cat = next((i for i in insights if i["categoria"] == expense["categoria"]), None)
         lines.append("")
         if this_cat and this_cat["meta"] > 0:
@@ -502,21 +451,16 @@ def build_confirmation(expense: dict, insights: list[dict], savings: float) -> s
         elif this_cat:
             lines.append(f"📊 *{expense['categoria']} — {month_name}:*")
             lines.append(f"Gasto total: €{this_cat['gasto']:.2f}  _(sem meta definida)_")
-
     return "\n".join(lines)
-
 # ─── Build full summary ───────────────────────────────────────────────────────
 def build_full_summary(insights: list[dict], savings: float, title: str = None) -> str:
     month_name = datetime.now(AMSTERDAM_TZ).strftime("%B").capitalize()
     if not title:
         title = f"📊 *Resumo Mensal — {month_name}*"
-
     lines = [title, ""]
     total_gasto = 0
     total_meta = 0
-
     sorted_cats = sorted([i for i in insights if i["meta"] > 0 or i["gasto"] > 0], key=lambda x: x["pct"], reverse=True)
-
     total_gasto_geral = 0.0
     for cat in sorted_cats:
         lines.append(f"*{cat['categoria']}*")
@@ -529,18 +473,15 @@ def build_full_summary(insights: list[dict], savings: float, title: str = None) 
             lines.append(f"€{cat['gasto']:.2f}  _(sem meta definida)_")
         lines.append("")
         total_gasto_geral += cat["gasto"]
-
     total_pct = (total_gasto / total_meta * 100) if total_meta > 0 else 0
     lines.append(f"💰 *TOTAL GASTOS (com meta): €{total_gasto:.2f} / €{total_meta:.2f}*")
     lines.append(f"`{progress_bar(total_pct)}`")
     sem_meta = total_gasto_geral - total_gasto
     if sem_meta > 0:
         lines.append(f"_+ €{sem_meta:.2f} em categorias sem meta_")
-
     # Savings — separate, never mixed with expenses
     lines.append("")
     lines.append(f"🐷 *Fundo Poupança (acumulado): €{savings:.2f}*")
-
     over    = [i for i in sorted_cats if i["pct"] >= 100]
     warning = [i for i in sorted_cats if 75 <= i["pct"] < 100]
     if over or warning:
@@ -551,30 +492,24 @@ def build_full_summary(insights: list[dict], savings: float, title: str = None) 
     if warning:
         names = " | ".join([f"*{i['categoria']}*" for i in warning])
         lines.append(f"🟡 Atenção (>75%): {names}")
-
     return "\n".join(lines)
-
 # ─── Generate monthly PDF report ─────────────────────────────────────────────
 def generate_monthly_pdf(insights: list[dict], savings: float) -> str:
     now = datetime.now(AMSTERDAM_TZ)
     month_name = now.strftime("%B").capitalize()
     filepath = f"/tmp/relatorio_{now.strftime('%Y_%m')}.pdf"
-
     doc = SimpleDocTemplate(filepath, pagesize=A4,
                              topMargin=1.5*cm, bottomMargin=1.5*cm,
                              leftMargin=1.5*cm, rightMargin=1.5*cm)
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle("TitleCustom", parent=styles["Title"], fontSize=20, alignment=TA_CENTER, spaceAfter=4)
     subtitle_style = ParagraphStyle("Subtitle", parent=styles["Normal"], fontSize=12, alignment=TA_CENTER, textColor=colors.grey, spaceAfter=20)
-
     elements = []
     elements.append(Paragraph(f"💰 Relatório de Gastos — {month_name} {now.year}", title_style))
     elements.append(Paragraph("Rafa &amp; Renata", subtitle_style))
-
     # Table data
     table_data = [["Categoria", "Gasto (€)", "Meta (€)", "Saldo (€)", "% Meta"]]
     total_gasto, total_meta = 0.0, 0.0
-
     sorted_cats = sorted(insights, key=lambda x: x["gasto"], reverse=True)
     for cat in sorted_cats:
         if cat["meta"] == 0 and cat["gasto"] == 0:
@@ -589,10 +524,8 @@ def generate_monthly_pdf(insights: list[dict], savings: float) -> str:
         if cat["meta"] > 0:
             total_gasto += cat["gasto"]
             total_meta += cat["meta"]
-
     table_data.append(["TOTAL", f"{total_gasto:.2f}", f"{total_meta:.2f}", f"{total_meta-total_gasto:.2f}",
                         f"{(total_gasto/total_meta*100) if total_meta else 0:.0f}%"])
-
     table = Table(table_data, colWidths=[5*cm, 3*cm, 3*cm, 3*cm, 2.5*cm])
     table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2d2d2d")),
@@ -609,49 +542,41 @@ def generate_monthly_pdf(insights: list[dict], savings: float) -> str:
     ]))
     elements.append(table)
     elements.append(Spacer(1, 20))
-
     savings_style = ParagraphStyle("Savings", parent=styles["Normal"], fontSize=13, textColor=colors.HexColor("#1a7a3c"))
     elements.append(Paragraph(f"🐷 Fundo Poupança (acumulado): € {savings:.2f}", savings_style))
-
     over = [c for c in insights if c["pct"] >= 100 and c["meta"] > 0]
     if over:
         elements.append(Spacer(1, 10))
         alert_style = ParagraphStyle("Alert", parent=styles["Normal"], fontSize=11, textColor=colors.HexColor("#c0392b"))
         names = ", ".join([c["categoria"] for c in over])
         elements.append(Paragraph(f"🔴 Categorias que estouraram a meta: {names}", alert_style))
-
     elements.append(Spacer(1, 30))
     footer_style = ParagraphStyle("Footer", parent=styles["Normal"], fontSize=8, textColor=colors.grey, alignment=TA_CENTER)
     elements.append(Paragraph(f"Gerado automaticamente em {now.strftime('%d/%m/%Y %H:%M')} (Amsterdam)", footer_style))
-
     doc.build(elements)
     return filepath
-
 # ─── Weekly summary job ───────────────────────────────────────────────────────
 async def send_weekly_summary(context) -> None:
     chat_id = context.job.data
     try:
-        insights, savings = get_category_insights()
+        insights, savings = await asyncio.to_thread(get_category_insights)
         now = datetime.now(AMSTERDAM_TZ)
         title = f"📊 *Resumo Semanal — {now.strftime('%d/%m/%Y')}*"
         msg = build_full_summary(insights, savings, title)
         await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Weekly summary error: {e}", exc_info=True)
-
 # ─── Handle delete request (find candidates + ask confirmation) ─────────────
 async def handle_delete_request(update: Update, context: ContextTypes.DEFAULT_TYPE, query_text: str, sender: str):
     await update.message.reply_text("🔍 Procurando o lançamento...")
     try:
-        matches = find_matching_lancamentos(query_text, sender)
-
+        matches = await asyncio.to_thread(find_matching_lancamentos, query_text, sender)
         if not matches:
             await update.message.reply_text(
                 "❌ Não encontrei nenhum lançamento que combine com isso.\n"
                 "Tenta descrever melhor (ex: \"remove a compra da Hornbach\")."
             )
             return
-
         if len(matches) == 1:
             m = matches[0]
             keyboard = [[
@@ -675,34 +600,28 @@ async def handle_delete_request(update: Update, context: ContextTypes.DEFAULT_TY
                 keyboard.append([InlineKeyboardButton(label[:60], callback_data=f"delrow_{m['row_number']}")])
             keyboard.append([InlineKeyboardButton("❌ Cancelar", callback_data="delrow_cancel")])
             await update.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard))
-
     except Exception as e:
         logger.error(f"Delete search error: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Erro ao buscar: `{e}`", parse_mode="Markdown")
-
 # ─── Callback handler for delete confirmation buttons ────────────────────────
 async def handle_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     if query.data == "delrow_cancel":
         await query.edit_message_text("❌ Cancelado. Nada foi apagado.")
         return
-
     if query.data.startswith("delrow_"):
         row_number = int(query.data.replace("delrow_", ""))
         try:
-            delete_lancamento_row(row_number)
+            await asyncio.to_thread(delete_lancamento_row, row_number)
             await query.edit_message_text("🗑️ Lançamento apagado com sucesso!")
         except Exception as e:
             logger.error(f"Delete row error: {e}", exc_info=True)
             await query.edit_message_text(f"❌ Erro ao apagar: `{e}`")
-
 # ─── Build preview message for confirmation ──────────────────────────────────
 def build_preview(expense: dict) -> str:
     is_savings = expense["categoria"] == "Poupança"
     valor = float(expense["valor"])
-
     lines = ["🔎 *Confirma esse lançamento?*\n"]
     lines.append(f"👤 {expense['quem_pagou']}")
     if is_savings:
@@ -715,39 +634,31 @@ def build_preview(expense: dict) -> str:
         lines.append(f"💶 € {valor:.2f}  ({expense['pago_com']})")
     if expense.get("observacao"):
         lines.append(f"💬 {expense['observacao']}")
-
     if expense.get("_warnings"):
         lines.append("")
         for w in expense["_warnings"]:
             lines.append(w)
-
     return "\n".join(lines)
-
 # ─── Callback handler for expense confirmation ───────────────────────────────
 async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     if query.data == "exp_cancel":
         await query.edit_message_text("❌ Cancelado. Nada foi lançado.")
         return
-
     if query.data.startswith("exp_confirm_"):
         key = query.data.replace("exp_confirm_", "")
         expense = PENDING_EXPENSES.pop(key, None)
         if not expense:
             await query.edit_message_text("⚠️ Esse lançamento expirou, manda de novo por favor.")
             return
-
         try:
-            insert_lancamento(expense)
-            insights, savings = get_category_insights()
+            await asyncio.to_thread(insert_lancamento, expense)
+            insights, savings = await asyncio.to_thread(get_category_insights)
             reply = build_confirmation(expense, insights, savings)
             await query.edit_message_text(reply, parse_mode="Markdown")
-
             # Proactive alert check (90%+) on the affected category
             await check_and_send_alert(context, query.message.chat_id, expense, insights)
-
         except Exception as e:
             logger.error(f"Confirm insert error: {e}", exc_info=True)
             error_str = str(e).lower()
@@ -759,7 +670,6 @@ async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_
             else:
                 await query.edit_message_text(f"❌ Erro ao lançar: `{e}`", parse_mode="Markdown")
         return
-
     if query.data.startswith("exp_edit_"):
         key = query.data.replace("exp_edit_", "")
         expense = PENDING_EXPENSES.get(key)
@@ -770,7 +680,6 @@ async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_
             "✏️ Manda a versão corrigida em texto ou áudio (ex: \"era 25 euros, não 35\")."
         )
         PENDING_EXPENSES.pop(key, None)
-
 # ─── Proactive alert when a category crosses 90% ─────────────────────────────
 async def check_and_send_alert(context, chat_id, expense: dict, insights: list[dict]):
     if expense["categoria"] == "Poupança":
@@ -795,7 +704,6 @@ async def check_and_send_alert(context, chat_id, expense: dict, insights: list[d
             await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
         except Exception as e:
             logger.error(f"Alert send error: {e}", exc_info=True)
-
 # ─── Voice handler ────────────────────────────────────────────────────────────
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender = identify_sender(update)
@@ -806,22 +714,17 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
             await tg_file.download_to_drive(tmp.name)
             tmp_path = tmp.name
-
         transcript = await transcribe_audio(tmp_path)
         logger.info(f"Transcript [{sender}]: {transcript}")
         os.unlink(tmp_path)
-
-        parsed = parse_expense(transcript, sender)
-
+        parsed = await asyncio.to_thread(parse_expense, transcript, sender)
         if parsed.get("is_summary_request"):
-            insights, savings = get_category_insights()
+            insights, savings = await asyncio.to_thread(get_category_insights)
             await update.message.reply_text(build_full_summary(insights, savings), parse_mode="Markdown")
             return
-
         if parsed.get("is_delete_request"):
             await handle_delete_request(update, context, parsed.get("delete_query", transcript), sender)
             return
-
         key = store_pending(parsed)
         keyboard = [[
             InlineKeyboardButton("✅ Confirmar", callback_data=f"exp_confirm_{key}"),
@@ -831,44 +734,37 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             build_preview(parsed), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard)
         )
-
     except Exception as e:
         logger.error(f"Voice error: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Erro: `{e}`", parse_mode="Markdown")
-
 # ─── Text handler ─────────────────────────────────────────────────────────────
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
     if text.startswith("/"):
         return
-
     sender = identify_sender(update)
     summary_keywords = ["resumo", "summary", "relatório", "relatorio", "como estamos"]
     if any(kw in text.lower() for kw in summary_keywords):
         await update.message.reply_text("📊 Carregando resumo...")
-        insights, savings = get_category_insights()
+        insights, savings = await asyncio.to_thread(get_category_insights)
         await update.message.reply_text(build_full_summary(insights, savings), parse_mode="Markdown")
         return
-
     delete_keywords = ["remove", "remover", "apaga", "apagar", "deleta", "deletar", "exclui", "excluir", "errei", "lancei errado", "lancei por engano"]
     if any(kw in text.lower() for kw in delete_keywords):
         await handle_delete_request(update, context, text, sender)
         return
-
     if not re.search(r'\d', text):
         return
-
     await update.message.reply_text("📝 Processando...")
     try:
-        expense = parse_expense(text, sender)
+        expense = await asyncio.to_thread(parse_expense, text, sender)
         if expense.get("is_summary_request"):
-            insights, savings = get_category_insights()
+            insights, savings = await asyncio.to_thread(get_category_insights)
             await update.message.reply_text(build_full_summary(insights, savings), parse_mode="Markdown")
             return
         if expense.get("is_delete_request"):
             await handle_delete_request(update, context, text, sender)
             return
-
         key = store_pending(expense)
         keyboard = [[
             InlineKeyboardButton("✅ Confirmar", callback_data=f"exp_confirm_{key}"),
@@ -881,14 +777,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Text error: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Erro: `{e}`", parse_mode="Markdown")
-
 # ─── /start ───────────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     job_name = f"weekly_{chat_id}"
     for job in context.job_queue.get_jobs_by_name(job_name):
         job.schedule_removal()
-
     context.job_queue.run_daily(
         send_weekly_summary,
         time=datetime.now(AMSTERDAM_TZ).replace(hour=8, minute=0, second=0, microsecond=0).timetz(),
@@ -896,19 +790,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name=job_name,
         data=chat_id
     )
-
     # Daily check for last day of month → triggers PDF report
     monthly_job_name = f"monthly_check_{chat_id}"
     for job in context.job_queue.get_jobs_by_name(monthly_job_name):
         job.schedule_removal()
-
     context.job_queue.run_daily(
         check_last_day_of_month,
         time=datetime.now(AMSTERDAM_TZ).replace(hour=20, minute=0, second=0, microsecond=0).timetz(),
         name=monthly_job_name,
         data=chat_id
     )
-
     await update.message.reply_text(
         "👋 *Bot de Gastos — Rafa & Renata* ativo!\n\n"
         "🎙️ Mande um *áudio* com o gasto:\n"
@@ -932,7 +823,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🗓️ Todo fim de mês às 20h: relatório PDF automático",
         parse_mode="Markdown"
     )
-
 # ─── /categorias — menu to pick a category and see its expenses ─────────────
 async def categorias(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = []
@@ -944,31 +834,24 @@ async def categorias(update: Update, context: ContextTypes.DEFAULT_TYPE):
             row = []
     if row:
         keyboard.append(row)
-
     await update.message.reply_text(
         "📂 *Escolha uma categoria para ver os gastos do mês:*",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
-
 # ─── Callback handler for category view buttons ─────────────────────────────
 async def handle_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     categoria = query.data.replace("catview_", "")
     month_name = datetime.now(AMSTERDAM_TZ).strftime("%B").capitalize()
-
     try:
-        expenses = list_expenses_by_category(categoria)
-
+        expenses = await asyncio.to_thread(list_expenses_by_category, categoria)
         is_savings_cat = (categoria == "Poupança")
         period_label = "Acumulado" if is_savings_cat else month_name
-
         if not expenses:
             await query.edit_message_text(f"📂 *{categoria} — {period_label}*\n\nNenhum lançamento encontrado.", parse_mode="Markdown")
             return
-
         lines = [f"📂 *{categoria} — {period_label}*\n"]
         total = 0.0
         for e in expenses:
@@ -981,9 +864,7 @@ async def handle_category_callback(update: Update, context: ContextTypes.DEFAULT
             desc = e["descricao"] or "–"
             obs = f" _({e['observacao']})_" if e["observacao"] else ""
             lines.append(f"• {e['data']} | {e['quem_pagou']} | {desc} | €{val:.2f}{obs}")
-
         lines.append(f"\n💰 *Total: €{total:.2f}*")
-
         # Add a back button
         keyboard = [[InlineKeyboardButton("⬅️ Voltar às categorias", callback_data="catview_back")]]
         await query.edit_message_text(
@@ -991,16 +872,13 @@ async def handle_category_callback(update: Update, context: ContextTypes.DEFAULT
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
-
     except Exception as e:
         logger.error(f"Category view error: {e}", exc_info=True)
         await query.edit_message_text(f"❌ Erro: `{e}`", parse_mode="Markdown")
-
 # ─── Callback handler for "back to categories" button ────────────────────────
 async def handle_category_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     keyboard = []
     row = []
     for cat in CATEGORIES:
@@ -1010,77 +888,65 @@ async def handle_category_back(update: Update, context: ContextTypes.DEFAULT_TYP
             row = []
     if row:
         keyboard.append(row)
-
     await query.edit_message_text(
         "📂 *Escolha uma categoria para ver os gastos do mês:*",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
-
 # ─── /resumo ──────────────────────────────────────────────────────────────────
 async def resumo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📊 Carregando resumo...")
     try:
-        insights, savings = get_category_insights()
+        insights, savings = await asyncio.to_thread(get_category_insights)
         await update.message.reply_text(build_full_summary(insights, savings), parse_mode="Markdown")
     except Exception as e:
         await update.message.reply_text(f"❌ Erro: `{e}`", parse_mode="Markdown")
-
 # ─── /metas — show current monthly goals ─────────────────────────────────────
 async def metas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🎯 Carregando metas...")
     try:
         now = datetime.now(AMSTERDAM_TZ)
-        result = get_month_summary(now.year, now.month)
+        result = await asyncio.to_thread(get_month_summary, now.year, now.month)
         insights = result["insights"]
-
         month_name = now.strftime("%B %Y").capitalize()
-        lines = [f"🎯 *Metas \u2014 {month_name}*\n"]
-
+        lines = [f"🎯 *Metas — {month_name}*\n"]
         # Sort by meta value descending
         sorted_cats = sorted(
             [i for i in insights if i["meta"] > 0],
             key=lambda x: x["meta"], reverse=True
         )
         no_meta = [i for i in insights if i["meta"] == 0 and i["gasto"] > 0]
-
         total_meta = 0.0
         for cat in sorted_cats:
             lines.append(f"• *{cat['categoria']}:* €{cat['meta']:.2f}")
             total_meta += cat["meta"]
-
         if no_meta:
             lines.append("")
             lines.append("_Sem meta definida:_")
             for cat in no_meta:
                 lines.append(f"• {cat['categoria']}")
-
         lines.append("")
         lines.append(f"💰 *Total orçamento: €{total_meta:.2f}*")
         lines.append("")
         lines.append("_Para alterar as metas, edita a aba **Metas** na planilha._")
-
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Metas error: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Erro: `{e}`", parse_mode="Markdown")
-
 # ─── /meses — month picker menu ──────────────────────────────────────────────
 async def meses(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🗓️ Carregando meses disponíveis...")
     try:
-        available = get_available_months()
+        available = await asyncio.to_thread(get_available_months)
         if not available:
             await update.message.reply_text("Nenhum lançamento encontrado ainda.")
             return
-
         keyboard = []
         for m in available:
             keyboard.append([InlineKeyboardButton(
                 m["label"],
                 callback_data=f"month_{m['year']}_{m['month']:02d}"
             )])
-
         await update.message.reply_text(
             "🗓️ *Seleciona um mês para ver o resumo:*",
             parse_mode="Markdown",
@@ -1089,12 +955,10 @@ async def meses(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Meses error: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Erro: `{e}`", parse_mode="Markdown")
-
 # ─── Callback handler for month view ─────────────────────────────────────────
 async def handle_month_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     try:
         _, year_str, month_str = query.data.split("_")
         year = int(year_str)
@@ -1102,22 +966,17 @@ async def handle_month_callback(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception:
         await query.edit_message_text("❌ Erro ao processar o mês selecionado.")
         return
-
     await query.edit_message_text("📊 Carregando resumo do mês...")
-
     try:
-        result = get_month_summary(year, month)
+        result = await asyncio.to_thread(get_month_summary, year, month)
         insights = result["insights"]
         savings = result["savings"]
-
         from datetime import date
         dt = date(year, month, 1)
         month_label = dt.strftime("%B %Y").capitalize()
-
         # Build summary text
         title = f"📊 *Resumo — {month_label}*"
         summary = build_full_summary(insights, savings, title)
-
         # Add back button
         keyboard = [[InlineKeyboardButton("⬅️ Voltar aos meses", callback_data="month_back")]]
         await query.edit_message_text(
@@ -1128,13 +987,12 @@ async def handle_month_callback(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         logger.error(f"Month callback error: {e}", exc_info=True)
         await query.edit_message_text(f"❌ Erro ao carregar mês: `{e}`", parse_mode="Markdown")
-
 # ─── Callback: back to month list ─────────────────────────────────────────────
 async def handle_month_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     try:
-        available = get_available_months()
+        available = await asyncio.to_thread(get_available_months)
         keyboard = []
         for m in available:
             keyboard.append([InlineKeyboardButton(
@@ -1148,31 +1006,28 @@ async def handle_month_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         await query.edit_message_text(f"❌ Erro: `{e}`", parse_mode="Markdown")
-
 # ─── /relatorio — PDF mensal ──────────────────────────────────────────────────
 async def relatorio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📄 Gerando relatório PDF...")
     try:
-        insights, savings = get_category_insights()
-        filepath = generate_monthly_pdf(insights, savings)
+        insights, savings = await asyncio.to_thread(get_category_insights)
+        filepath = await asyncio.to_thread(generate_monthly_pdf, insights, savings)
         with open(filepath, "rb") as f:
             await update.message.reply_document(document=f, filename=os.path.basename(filepath))
     except Exception as e:
         logger.error(f"PDF error: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Erro ao gerar PDF: `{e}`", parse_mode="Markdown")
-
 # ─── Monthly PDF job (last day of month, 20h Amsterdam) ──────────────────────
 async def send_monthly_pdf(context) -> None:
     chat_id = context.job.data
     try:
-        insights, savings = get_category_insights()
-        filepath = generate_monthly_pdf(insights, savings)
+        insights, savings = await asyncio.to_thread(get_category_insights)
+        filepath = await asyncio.to_thread(generate_monthly_pdf, insights, savings)
         with open(filepath, "rb") as f:
             await context.bot.send_document(chat_id=chat_id, document=f, filename=os.path.basename(filepath),
                                               caption="📄 Relatório mensal de gastos!")
     except Exception as e:
         logger.error(f"Monthly PDF job error: {e}", exc_info=True)
-
 async def check_last_day_of_month(context) -> None:
     """Runs daily; sends the PDF only if today is the last day of the month."""
     now = datetime.now(AMSTERDAM_TZ)
@@ -1180,7 +1035,6 @@ async def check_last_day_of_month(context) -> None:
     from datetime import timedelta
     if (tomorrow + timedelta(days=1)).month != now.month:
         await send_monthly_pdf(context)
-
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
     token = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -1201,6 +1055,5 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     logger.info("🤖 Bot iniciado!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 if __name__ == "__main__":
     main()
