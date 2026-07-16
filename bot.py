@@ -4,6 +4,7 @@ import logging
 import tempfile
 import re
 import asyncio
+import unicodedata
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -19,7 +20,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER
 from reportlab.graphics.shapes import Drawing
 from reportlab.graphics.charts.piecharts import Pie
-from reportlab.graphics import renderPM
+from PIL import Image, ImageDraw, ImageFont
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
@@ -693,15 +694,55 @@ def build_expense_pie_drawing(insights: list[dict]):
         pie.slices[i].fillColor = colors.HexColor(PIE_PALETTE[i % len(PIE_PALETTE)])
     drawing.add(pie)
     return drawing
+def _strip_accents(text: str) -> str:
+    """Removes accents (Distribuição → Distribuicao). Only used for the PNG
+    chart, whose bundled bitmap font doesn't cover accented characters —
+    the Telegram text messages and the PDF keep full accents normally."""
+    return "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c))
+def _pie_font(size: int):
+    """Loads Pillow's own bundled font at the given size. Deliberately does
+    NOT use ImageFont.truetype() with a font name, because that relies on
+    fontconfig + font files being present on the OS (often missing on slim
+    Docker images) — load_default() is bundled inside Pillow itself, so it
+    always works regardless of the deployment environment."""
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
 def generate_expense_pie_png(insights: list[dict]) -> str:
-    """Renders the expense pie chart as a standalone PNG, for a quick visual
-    preview sent directly in the Telegram chat (no need to generate the
-    full PDF). Returns None if there's nothing to chart."""
-    drawing = build_expense_pie_drawing(insights)
-    if drawing is None:
+    """Renders the expense pie chart as a standalone PNG using Pillow, for a
+    quick visual preview sent directly in the Telegram chat (no need to
+    generate the full PDF). Returns None if there's nothing to chart.
+    (Deliberately NOT using reportlab's renderPM here — it depends on a
+    platform-specific binary/font setup that can silently fail on slimmer
+    Docker images; Pillow's own bundled font has no such dependency.)"""
+    sorted_cats = sorted(insights, key=lambda x: x["gasto"], reverse=True)
+    grand_total = sum(c["gasto"] for c in sorted_cats)
+    chart_cats = [c for c in sorted_cats if c["gasto"] > 0]
+    if not chart_cats or grand_total <= 0:
         return None
+    W, H = 640, 400
+    cx, cy, r = 210, 200, 150
+    img = Image.new("RGB", (W, H), "white")
+    draw = ImageDraw.Draw(img)
+    font = _pie_font(16)
+    font_bold = _pie_font(18)
+    bbox = [cx - r, cy - r, cx + r, cy + r]
+    start_angle = -90.0
+    legend_x, legend_y = cx + r + 50, 60
+    for i, cat in enumerate(chart_cats):
+        pct = cat["gasto"] / grand_total * 100
+        end_angle = start_angle + (pct / 100 * 360)
+        color = PIE_PALETTE[i % len(PIE_PALETTE)]
+        draw.pieslice(bbox, start_angle, end_angle, fill=color, outline="white", width=2)
+        draw.rectangle([legend_x, legend_y, legend_x + 16, legend_y + 16], fill=color)
+        label = f"{_strip_accents(cat['categoria'])} ({pct:.0f}%)"
+        draw.text((legend_x + 24, legend_y - 1), label, fill="black", font=font)
+        legend_y += 28
+        start_angle = end_angle
+    draw.text((20, 20), "Distribuicao de gastos", fill="black", font=font_bold)
     filepath = f"/tmp/grafico_{datetime.now(AMSTERDAM_TZ).strftime('%Y%m%d_%H%M%S_%f')}.png"
-    renderPM.drawToFile(drawing, filepath, fmt="PNG")
+    img.save(filepath, "PNG")
     return filepath
 async def send_summary_with_chart(bot, chat_id, insights: list[dict], savings: float,
                                     title: str = None, trend_line: str = "") -> None:
@@ -713,7 +754,7 @@ async def send_summary_with_chart(bot, chat_id, insights: list[dict], savings: f
             with open(chart_path, "rb") as f:
                 await bot.send_photo(chat_id=chat_id, photo=f)
     except Exception as e:
-        logger.warning(f"Chart preview skipped: {e}")
+        logger.warning(f"Chart preview skipped: {e}", exc_info=True)
     await bot.send_message(
         chat_id=chat_id,
         text=build_full_summary(insights, savings, title, trend_line),
@@ -1373,7 +1414,7 @@ async def handle_month_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 with open(chart_path, "rb") as f:
                     await context.bot.send_photo(chat_id=query.message.chat_id, photo=f)
         except Exception as e:
-            logger.warning(f"Chart preview skipped: {e}")
+            logger.warning(f"Chart preview skipped: {e}", exc_info=True)
         # Build summary text
         title = f"📊 *Resumo — {month_label}*"
         summary = build_full_summary(insights, savings, title, trend_line=trend)
