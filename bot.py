@@ -647,7 +647,12 @@ def generate_monthly_pdf(insights: list[dict], savings: float, year: int = None,
     elements.append(Paragraph(f"Relatório de Gastos — {month_name} {year}", title_style))
     elements.append(Paragraph("Rafa &amp; Renata", subtitle_style))
     sorted_cats = sorted(insights, key=lambda x: x["gasto"], reverse=True)
-    # ── Pie chart: distribuição de gastos por categoria ──
+    # Total gasto do mês (todas as categorias, com ou sem meta) — usado pra
+    # calcular o peso (%) de cada categoria dentro do total gasto.
+    grand_total_gasto = sum(c["gasto"] for c in sorted_cats)
+    def pct_of_total(gasto: float) -> float:
+        return (gasto / grand_total_gasto * 100) if grand_total_gasto > 0 else 0.0
+    # ── Pie chart: distribuição de gastos por categoria (% do total gasto) ──
     chart_cats = [c for c in sorted_cats if c["gasto"] > 0]
     PIE_PALETTE = [
         "#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B2",
@@ -661,11 +666,7 @@ def generate_monthly_pdf(insights: list[dict], savings: float, year: int = None,
         pie.width = 170
         pie.height = 170
         pie.data = [c["gasto"] for c in chart_cats]
-        pie.labels = [
-            f"{c['categoria']} ({c['pct']:.0f}%)" if c["meta"] > 0
-            else c["categoria"]
-            for c in chart_cats
-        ]
+        pie.labels = [f"{c['categoria']} ({pct_of_total(c['gasto']):.0f}%)" for c in chart_cats]
         pie.simpleLabels = 0
         pie.sideLabels = 1
         pie.slices.strokeWidth = 0.5
@@ -676,7 +677,7 @@ def generate_monthly_pdf(insights: list[dict], savings: float, year: int = None,
         elements.append(drawing)
         elements.append(Spacer(1, 10))
     # Table data (com cor por linha conforme % da meta)
-    table_data = [["Categoria", "Gasto (€)", "Meta (€)", "Saldo (€)", "% Meta"]]
+    table_data = [["Categoria", "Gasto (€)", "Meta (€)", "Saldo (€)", "% Meta", "% do Total"]]
     row_colors = []
     total_gasto, total_meta = 0.0, 0.0
     for cat in sorted_cats:
@@ -688,6 +689,7 @@ def generate_monthly_pdf(insights: list[dict], savings: float, year: int = None,
             f"{cat['meta']:.2f}" if cat["meta"] > 0 else "–",
             f"{cat['saldo']:.2f}" if cat["meta"] > 0 else "–",
             f"{cat['pct']:.0f}%" if cat["meta"] > 0 else "–",
+            f"{pct_of_total(cat['gasto']):.0f}%",
         ])
         if cat["meta"] > 0:
             total_gasto += cat["gasto"]
@@ -701,8 +703,9 @@ def generate_monthly_pdf(insights: list[dict], savings: float, year: int = None,
         else:
             row_colors.append(colors.white)
     table_data.append(["TOTAL", f"{total_gasto:.2f}", f"{total_meta:.2f}", f"{total_meta-total_gasto:.2f}",
-                        f"{(total_gasto/total_meta*100) if total_meta else 0:.0f}%"])
-    table = Table(table_data, colWidths=[5*cm, 3*cm, 3*cm, 3*cm, 2.5*cm])
+                        f"{(total_gasto/total_meta*100) if total_meta else 0:.0f}%",
+                        f"{pct_of_total(grand_total_gasto):.0f}%"])
+    table = Table(table_data, colWidths=[3.7*cm, 2.5*cm, 2.5*cm, 2.5*cm, 2*cm, 2.3*cm])
     table_style_cmds = [
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2d2d2d")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
