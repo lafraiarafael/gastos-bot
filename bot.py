@@ -19,6 +19,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER
 from reportlab.graphics.shapes import Drawing
 from reportlab.graphics.charts.piecharts import Pie
+from reportlab.graphics import renderPM
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
@@ -98,6 +99,13 @@ CATEGORY_EMOJIS = {
 }
 def cat_emoji(categoria: str) -> str:
     return CATEGORY_EMOJIS.get(categoria, "📂")
+# ─── Emoji por quem pagou e por forma de pagamento ───────────────────────────
+PERSON_EMOJIS = {"Rafa": "👨", "Renata": "👩"}
+def person_emoji(nome: str) -> str:
+    return PERSON_EMOJIS.get(nome, "👤")
+PAYMENT_EMOJIS = {"Débito": "💶", "Crédito": "💳"}
+def payment_emoji(metodo: str) -> str:
+    return PAYMENT_EMOJIS.get(metodo, "💰")
 # ─── Identify sender ──────────────────────────────────────────────────────────
 def identify_sender(update: Update) -> str:
     user = update.effective_user
@@ -547,19 +555,43 @@ def get_category_insights() -> tuple[list[dict], float]:
     now = datetime.now(AMSTERDAM_TZ)
     result = get_month_summary(now.year, now.month)
     return result["insights"], result["savings"]
+# ─── Trend: compara o total gasto de um mês com o mês anterior ──────────────
+def compute_trend_line(current_total: float, year: int, month: int) -> str:
+    """Returns a formatted 📈/📉 line comparing current_total against the
+    previous month's total gasto. Returns '' if there's nothing to compare
+    against (e.g. no lançamentos in the previous month)."""
+    prev_month = month - 1
+    prev_year = year
+    if prev_month == 0:
+        prev_month = 12
+        prev_year -= 1
+    try:
+        prev_result = get_month_summary(prev_year, prev_month)
+        prev_total = sum(c["gasto"] for c in prev_result["insights"])
+    except Exception as e:
+        logger.warning(f"Trend comparison skipped: {e}")
+        return ""
+    if prev_total <= 0:
+        return ""
+    delta_pct = (current_total - prev_total) / prev_total * 100
+    if abs(delta_pct) < 1:
+        return "➡️ Igual ao mês passado"
+    arrow = "📈" if delta_pct > 0 else "📉"
+    direction = "a mais" if delta_pct > 0 else "a menos"
+    return f"{arrow} {abs(delta_pct):.0f}% {direction} que o mês passado"
 # ─── Build confirmation (category only) ──────────────────────────────────────
 def build_confirmation(expense: dict, insights: list[dict], savings: float) -> str:
     month_name = datetime.now(AMSTERDAM_TZ).strftime("%B").capitalize()
     is_savings = expense["categoria"] == "Poupança"
     lines = []
     lines.append(f"✅ *Lançado com sucesso!*\n")
-    lines.append(f"👤 *{expense['quem_pagou']}*")
+    lines.append(f"{person_emoji(expense['quem_pagou'])} *{expense['quem_pagou']}*")
     if is_savings:
         valor = float(expense['valor'])
         is_withdrawal = valor < 0
         action_label = "Retirada da" if is_withdrawal else "Depósito na"
         lines.append(f"🐷 {action_label} Poupança  |  📝 {expense.get('descricao', '–')}")
-        lines.append(f"💶 *€ {abs(valor):.2f}*  ({expense['pago_com']})")
+        lines.append(f"💶 *€ {abs(valor):.2f}*  ({payment_emoji(expense['pago_com'])} {expense['pago_com']})")
         if expense.get("observacao"):
             lines.append(f"💬 _{expense['observacao']}_")
         lines.append("")
@@ -567,7 +599,7 @@ def build_confirmation(expense: dict, insights: list[dict], savings: float) -> s
         lines.append(f"💰 *€ {savings:.2f}*")
     else:
         lines.append(f"{cat_emoji(expense['categoria'])} {expense['categoria']}  |  📝 {expense.get('descricao', '–')}")
-        lines.append(f"💶 *€ {float(expense['valor']):.2f}*  ({expense['pago_com']})")
+        lines.append(f"💶 *€ {float(expense['valor']):.2f}*  ({payment_emoji(expense['pago_com'])} {expense['pago_com']})")
         if expense.get("observacao"):
             lines.append(f"💬 _{expense['observacao']}_")
         this_cat = next((i for i in insights if i["categoria"] == expense["categoria"]), None)
@@ -585,11 +617,16 @@ def build_confirmation(expense: dict, insights: list[dict], savings: float) -> s
             lines.append(f"Gasto total: €{this_cat['gasto']:.2f}  _(sem meta definida)_")
     return "\n".join(lines)
 # ─── Build full summary ───────────────────────────────────────────────────────
-def build_full_summary(insights: list[dict], savings: float, title: str = None) -> str:
+SEPARATOR = "─────────────"
+def build_full_summary(insights: list[dict], savings: float, title: str = None, trend_line: str = "") -> str:
     month_name = datetime.now(AMSTERDAM_TZ).strftime("%B").capitalize()
     if not title:
         title = f"📊 *Resumo Mensal — {month_name}*"
-    lines = [title, ""]
+    lines = [title]
+    if trend_line:
+        lines.append(trend_line)
+    lines.append("")
+    lines.append(SEPARATOR)
     total_gasto = 0
     total_meta = 0
     sorted_cats = sorted([i for i in insights if i["meta"] > 0 or i["gasto"] > 0], key=lambda x: x["pct"], reverse=True)
@@ -605,6 +642,7 @@ def build_full_summary(insights: list[dict], savings: float, title: str = None) 
             lines.append(f"€{cat['gasto']:.2f}  _(sem meta definida)_")
         lines.append("")
         total_gasto_geral += cat["gasto"]
+    lines.append(SEPARATOR)
     total_pct = (total_gasto / total_meta * 100) if total_meta > 0 else 0
     lines.append(f"💰 *TOTAL GASTOS (com meta): €{total_gasto:.2f} / €{total_meta:.2f}*")
     lines.append(f"`{progress_bar(total_pct)}`")
@@ -625,6 +663,62 @@ def build_full_summary(insights: list[dict], savings: float, title: str = None) 
         names = " | ".join([f"*{i['categoria']}*" for i in warning])
         lines.append(f"🟡 Atenção (>75%): {names}")
     return "\n".join(lines)
+# ─── Pie chart (compartilhado entre o PDF e o preview rápido no Telegram) ───
+PIE_PALETTE = [
+    "#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B2",
+    "#937860", "#DA8BC3", "#8C8C8C", "#CCB974", "#64B5CD", "#A0522D", "#4C4C4C",
+]
+def build_expense_pie_drawing(insights: list[dict]):
+    """Builds a reportlab Drawing with a pie chart of gasto by category,
+    with each slice labeled by its share (%) of the total gasto. Returns
+    None if there's nothing to chart."""
+    sorted_cats = sorted(insights, key=lambda x: x["gasto"], reverse=True)
+    grand_total = sum(c["gasto"] for c in sorted_cats)
+    chart_cats = [c for c in sorted_cats if c["gasto"] > 0]
+    if not chart_cats or grand_total <= 0:
+        return None
+    drawing = Drawing(400, 210)
+    pie = Pie()
+    pie.x = 110
+    pie.y = 15
+    pie.width = 170
+    pie.height = 170
+    pie.data = [c["gasto"] for c in chart_cats]
+    pie.labels = [f"{c['categoria']} ({(c['gasto']/grand_total*100):.0f}%)" for c in chart_cats]
+    pie.simpleLabels = 0
+    pie.sideLabels = 1
+    pie.slices.strokeWidth = 0.5
+    pie.slices.strokeColor = colors.white
+    for i in range(len(pie.data)):
+        pie.slices[i].fillColor = colors.HexColor(PIE_PALETTE[i % len(PIE_PALETTE)])
+    drawing.add(pie)
+    return drawing
+def generate_expense_pie_png(insights: list[dict]) -> str:
+    """Renders the expense pie chart as a standalone PNG, for a quick visual
+    preview sent directly in the Telegram chat (no need to generate the
+    full PDF). Returns None if there's nothing to chart."""
+    drawing = build_expense_pie_drawing(insights)
+    if drawing is None:
+        return None
+    filepath = f"/tmp/grafico_{datetime.now(AMSTERDAM_TZ).strftime('%Y%m%d_%H%M%S_%f')}.png"
+    renderPM.drawToFile(drawing, filepath, fmt="PNG")
+    return filepath
+async def send_summary_with_chart(bot, chat_id, insights: list[dict], savings: float,
+                                    title: str = None, trend_line: str = "") -> None:
+    """Sends a quick pie-chart preview (best-effort, skipped on failure)
+    followed by the full text summary."""
+    try:
+        chart_path = await asyncio.to_thread(generate_expense_pie_png, insights)
+        if chart_path:
+            with open(chart_path, "rb") as f:
+                await bot.send_photo(chat_id=chat_id, photo=f)
+    except Exception as e:
+        logger.warning(f"Chart preview skipped: {e}")
+    await bot.send_message(
+        chat_id=chat_id,
+        text=build_full_summary(insights, savings, title, trend_line),
+        parse_mode="Markdown"
+    )
 # ─── Generate monthly PDF report ─────────────────────────────────────────────
 def generate_monthly_pdf(insights: list[dict], savings: float, year: int = None, month: int = None) -> str:
     """Builds the PDF for the given year/month. Defaults to the current
@@ -653,27 +747,8 @@ def generate_monthly_pdf(insights: list[dict], savings: float, year: int = None,
     def pct_of_total(gasto: float) -> float:
         return (gasto / grand_total_gasto * 100) if grand_total_gasto > 0 else 0.0
     # ── Pie chart: distribuição de gastos por categoria (% do total gasto) ──
-    chart_cats = [c for c in sorted_cats if c["gasto"] > 0]
-    PIE_PALETTE = [
-        "#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B2",
-        "#937860", "#DA8BC3", "#8C8C8C", "#CCB974", "#64B5CD", "#A0522D", "#4C4C4C",
-    ]
-    if chart_cats:
-        drawing = Drawing(400, 210)
-        pie = Pie()
-        pie.x = 110
-        pie.y = 15
-        pie.width = 170
-        pie.height = 170
-        pie.data = [c["gasto"] for c in chart_cats]
-        pie.labels = [f"{c['categoria']} ({pct_of_total(c['gasto']):.0f}%)" for c in chart_cats]
-        pie.simpleLabels = 0
-        pie.sideLabels = 1
-        pie.slices.strokeWidth = 0.5
-        pie.slices.strokeColor = colors.white
-        for i in range(len(pie.data)):
-            pie.slices[i].fillColor = colors.HexColor(PIE_PALETTE[i % len(PIE_PALETTE)])
-        drawing.add(pie)
+    drawing = build_expense_pie_drawing(insights)
+    if drawing is not None:
         elements.append(drawing)
         elements.append(Spacer(1, 10))
     # Table data (com cor por linha conforme % da meta)
@@ -743,8 +818,9 @@ async def send_weekly_summary(context) -> None:
         insights, savings = await asyncio.to_thread(get_category_insights)
         now = datetime.now(AMSTERDAM_TZ)
         title = f"📊 *Resumo Semanal — {now.strftime('%d/%m/%Y')}*"
-        msg = build_full_summary(insights, savings, title)
-        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+        total = sum(c["gasto"] for c in insights)
+        trend = await asyncio.to_thread(compute_trend_line, total, now.year, now.month)
+        await send_summary_with_chart(context.bot, chat_id, insights, savings, title=title, trend_line=trend)
     except Exception as e:
         logger.error(f"Weekly summary error: {e}", exc_info=True)
 # ─── Handle delete request (find candidates + ask confirmation) ─────────────
@@ -766,7 +842,7 @@ async def handle_delete_request(update: Update, context: ContextTypes.DEFAULT_TY
             ]]
             text = (
                 f"Encontrei este lançamento:\n\n"
-                f"📅 {m['data']} | 👤 {m['quem_pagou']}\n"
+                f"📅 {m['data']} | {person_emoji(m['quem_pagou'])} {m['quem_pagou']}\n"
                 f"📂 {m['categoria']} | 📝 {m['descricao']}\n"
                 f"💶 €{m['valor_raw']}\n\n"
                 f"Quer apagar?"
@@ -804,15 +880,15 @@ def build_preview(expense: dict) -> str:
     is_savings = expense["categoria"] == "Poupança"
     valor = float(expense["valor"])
     lines = ["🔎 *Confirma esse lançamento?*\n"]
-    lines.append(f"👤 {expense['quem_pagou']}")
+    lines.append(f"{person_emoji(expense['quem_pagou'])} {expense['quem_pagou']}")
     if is_savings:
         action = "Retirada da" if valor < 0 else "Depósito na"
         lines.append(f"🐷 {action} Poupança")
-        lines.append(f"💶 € {abs(valor):.2f}  ({expense['pago_com']})")
+        lines.append(f"💶 € {abs(valor):.2f}  ({payment_emoji(expense['pago_com'])} {expense['pago_com']})")
     else:
         lines.append(f"{cat_emoji(expense['categoria'])} {expense['categoria']}")
         lines.append(f"📝 {expense.get('descricao', '–')}")
-        lines.append(f"💶 € {valor:.2f}  ({expense['pago_com']})")
+        lines.append(f"💶 € {valor:.2f}  ({payment_emoji(expense['pago_com'])} {expense['pago_com']})")
     if expense.get("observacao"):
         lines.append(f"💬 {expense['observacao']}")
     if expense.get("_warnings"):
@@ -901,7 +977,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parsed = await asyncio.to_thread(parse_expense, transcript, sender)
         if parsed.get("is_summary_request"):
             insights, savings = await asyncio.to_thread(get_category_insights)
-            await update.message.reply_text(build_full_summary(insights, savings), parse_mode="Markdown")
+            now = datetime.now(AMSTERDAM_TZ)
+            total = sum(c["gasto"] for c in insights)
+            trend = await asyncio.to_thread(compute_trend_line, total, now.year, now.month)
+            await send_summary_with_chart(context.bot, update.effective_chat.id, insights, savings, trend_line=trend)
             return
         if parsed.get("is_delete_request"):
             await handle_delete_request(update, context, parsed.get("delete_query", transcript), sender)
@@ -956,7 +1035,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if any(kw in text.lower() for kw in summary_keywords):
         await update.message.reply_text("📊 Carregando resumo...")
         insights, savings = await asyncio.to_thread(get_category_insights)
-        await update.message.reply_text(build_full_summary(insights, savings), parse_mode="Markdown")
+        now = datetime.now(AMSTERDAM_TZ)
+        total = sum(c["gasto"] for c in insights)
+        trend = await asyncio.to_thread(compute_trend_line, total, now.year, now.month)
+        await send_summary_with_chart(context.bot, update.effective_chat.id, insights, savings, trend_line=trend)
         return
     delete_keywords = ["remove", "remover", "apaga", "apagar", "deleta", "deletar", "exclui", "excluir", "errei", "lancei errado", "lancei por engano"]
     if any(kw in text.lower() for kw in delete_keywords):
@@ -969,7 +1051,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         expense = await asyncio.to_thread(parse_expense, text, sender)
         if expense.get("is_summary_request"):
             insights, savings = await asyncio.to_thread(get_category_insights)
-            await update.message.reply_text(build_full_summary(insights, savings), parse_mode="Markdown")
+            now = datetime.now(AMSTERDAM_TZ)
+            total = sum(c["gasto"] for c in insights)
+            trend = await asyncio.to_thread(compute_trend_line, total, now.year, now.month)
+            await send_summary_with_chart(context.bot, update.effective_chat.id, insights, savings, trend_line=trend)
             return
         if expense.get("is_delete_request"):
             await handle_delete_request(update, context, text, sender)
@@ -1108,8 +1193,16 @@ async def handle_category_callback(update: Update, context: ContextTypes.DEFAULT
             total += val
             desc = e["descricao"] or "–"
             obs = f" _({e['observacao']})_" if e["observacao"] else ""
-            lines.append(f"• {e['data']} | {e['quem_pagou']} | {desc} | €{val:.2f}{obs}")
+            lines.append(f"• {e['data']} | {person_emoji(e['quem_pagou'])} {e['quem_pagou']} | {desc} | €{val:.2f}{obs}")
         lines.append(f"\n💰 *Total: €{total:.2f}*")
+        # Barra de progresso vs. meta da categoria (não se aplica à Poupança)
+        if not is_savings_cat:
+            now = datetime.now(AMSTERDAM_TZ)
+            summary = await asyncio.to_thread(get_month_summary, now.year, now.month)
+            this_cat = next((i for i in summary["insights"] if i["categoria"] == categoria), None)
+            if this_cat and this_cat["meta"] > 0:
+                lines.append(f"`{progress_bar(this_cat['pct'])}`")
+                lines.append(f"€{this_cat['gasto']:.2f} / €{this_cat['meta']:.2f}  |  Saldo €{this_cat['saldo']:.2f}")
         # Add a back button
         keyboard = [[InlineKeyboardButton("⬅️ Voltar às categorias", callback_data="catview_back")]]
         await query.edit_message_text(
@@ -1143,8 +1236,12 @@ async def resumo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📊 Carregando resumo...")
     try:
         insights, savings = await asyncio.to_thread(get_category_insights)
-        await update.message.reply_text(build_full_summary(insights, savings), parse_mode="Markdown")
+        now = datetime.now(AMSTERDAM_TZ)
+        total = sum(c["gasto"] for c in insights)
+        trend = await asyncio.to_thread(compute_trend_line, total, now.year, now.month)
+        await send_summary_with_chart(context.bot, update.effective_chat.id, insights, savings, trend_line=trend)
     except Exception as e:
+        logger.error(f"Resumo error: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Erro: `{e}`", parse_mode="Markdown")
 # ─── /metas — show current monthly goals ─────────────────────────────────────
 async def metas(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1267,9 +1364,19 @@ async def handle_month_callback(update: Update, context: ContextTypes.DEFAULT_TY
         from datetime import date
         dt = date(year, month, 1)
         month_label = dt.strftime("%B %Y").capitalize()
+        total = sum(c["gasto"] for c in insights)
+        trend = await asyncio.to_thread(compute_trend_line, total, year, month)
+        # Gráfico rápido (best-effort) antes do texto
+        try:
+            chart_path = await asyncio.to_thread(generate_expense_pie_png, insights)
+            if chart_path:
+                with open(chart_path, "rb") as f:
+                    await context.bot.send_photo(chat_id=query.message.chat_id, photo=f)
+        except Exception as e:
+            logger.warning(f"Chart preview skipped: {e}")
         # Build summary text
         title = f"📊 *Resumo — {month_label}*"
-        summary = build_full_summary(insights, savings, title)
+        summary = build_full_summary(insights, savings, title, trend_line=trend)
         # Add back button
         keyboard = [[InlineKeyboardButton("⬅️ Voltar aos meses", callback_data="month_back")]]
         await query.edit_message_text(
