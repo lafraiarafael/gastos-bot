@@ -876,11 +876,46 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/metas`\n\n"
         "🗑️ Para apagar um lançamento:\n"
         "_\"remove a compra do supermercado\"_\n\n"
+        "📖 Para ver todos os comandos e como o bot funciona:\n"
+        "`/comandos`\n\n"
         "✅ Todo lançamento pede confirmação antes de salvar!\n\n"
         "🗓️ Toda segunda-feira às 8h: resumo automático\n"
         "🗓️ Todo fim de mês às 20h: relatório PDF automático",
         parse_mode="Markdown"
     )
+# ─── /comandos — explica os comandos e como o bot funciona ──────────────────
+async def comandos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "📖 *Como o bot funciona*\n\n"
+        "Este bot registra os gastos do casal direto numa planilha Google Sheets, "
+        "a partir de mensagens de *áudio* ou *texto*. Toda vez que alguém manda um gasto, "
+        "o bot entende o valor, categoria e quem pagou, e pede confirmação antes de salvar.\n\n"
+        "─────────────\n"
+        "🎙️ *Lançar um gasto*\n"
+        "Manda áudio ou texto, por exemplo:\n"
+        "_\"Gastei 32 euros no supermercado, débito\"_\n\n"
+        "🐷 *Poupança*\n"
+        "_\"Guardei 200 euros este mês\"_ → soma ao fundo\n"
+        "_\"Tirei 50 da poupança\"_ → subtrai do fundo\n\n"
+        "🗑️ *Apagar um lançamento*\n"
+        "_\"remove a compra do supermercado\"_ — o bot procura e pede confirmação.\n\n"
+        "─────────────\n"
+        "📋 *Comandos*\n\n"
+        "`/resumo` — resumo do mês atual (gasto x meta por categoria)\n"
+        "`/categorias` — menu pra ver os lançamentos de uma categoria específica\n"
+        "`/meses` — resumo de qualquer mês anterior\n"
+        "`/metas` — mostra as metas atuais de cada categoria\n"
+        "`/relatorio` — gera um PDF do mês atual, com gráfico e tabela\n"
+        "`/comandos` — mostra esta lista\n\n"
+        "─────────────\n"
+        "⚙️ *Automático*\n\n"
+        "✅ Todo lançamento pede confirmação antes de salvar\n"
+        "🟡 Alerta automático quando uma categoria passa de 90% da meta\n"
+        "🗓️ Toda segunda-feira às 8h: resumo semanal automático\n"
+        "🗓️ Todo fim de mês às 20h: relatório PDF automático\n\n"
+        "_Para mudar as metas, edita a aba **Metas** direto na planilha._"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
 # ─── /categorias — menu to pick a category and see its expenses ─────────────
 async def categorias(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = []
@@ -1104,6 +1139,7 @@ def main():
     app.add_handler(CommandHandler("categorias", categorias))
     app.add_handler(CommandHandler("meses",      meses))
     app.add_handler(CommandHandler("metas",      metas))
+    app.add_handler(CommandHandler("comandos",   comandos))
     app.add_handler(CallbackQueryHandler(handle_delete_callback,  pattern="^delrow_"))
     app.add_handler(CallbackQueryHandler(handle_category_back,    pattern="^catview_back$"))
     app.add_handler(CallbackQueryHandler(handle_category_callback,pattern="^catview_"))
