@@ -17,6 +17,8 @@ from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER
+from reportlab.graphics.shapes import Drawing
+from reportlab.graphics.charts.piecharts import Pie
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
@@ -77,6 +79,23 @@ CATEGORIES = [
     "Saúde", "Lazer", "Educação", "Roupas",
     "Farmácia", "Impostos", "Outros", "Poupança"
 ]
+# ─── Emoji fixo por categoria (facilita escanear visualmente) ───────────────
+CATEGORY_EMOJIS = {
+    "Alimentação": "🍔",
+    "Transporte": "🚗",
+    "Moradia": "🏠",
+    "Utilidades": "💡",
+    "Saúde": "🏥",
+    "Lazer": "🎉",
+    "Educação": "📚",
+    "Roupas": "👕",
+    "Farmácia": "💊",
+    "Impostos": "🧾",
+    "Outros": "📦",
+    "Poupança": "🐷",
+}
+def cat_emoji(categoria: str) -> str:
+    return CATEGORY_EMOJIS.get(categoria, "📂")
 # ─── Identify sender ──────────────────────────────────────────────────────────
 def identify_sender(update: Update) -> str:
     user = update.effective_user
@@ -434,7 +453,7 @@ def build_confirmation(expense: dict, insights: list[dict], savings: float) -> s
         lines.append(f"🐷 *Fundo Poupança (acumulado):*")
         lines.append(f"💰 *€ {savings:.2f}*")
     else:
-        lines.append(f"📂 {expense['categoria']}  |  📝 {expense.get('descricao', '–')}")
+        lines.append(f"{cat_emoji(expense['categoria'])} {expense['categoria']}  |  📝 {expense.get('descricao', '–')}")
         lines.append(f"💶 *€ {float(expense['valor']):.2f}*  ({expense['pago_com']})")
         if expense.get("observacao"):
             lines.append(f"💬 _{expense['observacao']}_")
@@ -463,7 +482,7 @@ def build_full_summary(insights: list[dict], savings: float, title: str = None) 
     sorted_cats = sorted([i for i in insights if i["meta"] > 0 or i["gasto"] > 0], key=lambda x: x["pct"], reverse=True)
     total_gasto_geral = 0.0
     for cat in sorted_cats:
-        lines.append(f"*{cat['categoria']}*")
+        lines.append(f"{cat_emoji(cat['categoria'])} *{cat['categoria']}*")
         if cat["meta"] > 0:
             lines.append(f"`{progress_bar(cat['pct'])}`")
             lines.append(f"€{cat['gasto']:.2f} / €{cat['meta']:.2f}  |  Saldo €{cat['saldo']:.2f}")
@@ -505,12 +524,41 @@ def generate_monthly_pdf(insights: list[dict], savings: float) -> str:
     title_style = ParagraphStyle("TitleCustom", parent=styles["Title"], fontSize=20, alignment=TA_CENTER, spaceAfter=4)
     subtitle_style = ParagraphStyle("Subtitle", parent=styles["Normal"], fontSize=12, alignment=TA_CENTER, textColor=colors.grey, spaceAfter=20)
     elements = []
-    elements.append(Paragraph(f"💰 Relatório de Gastos — {month_name} {now.year}", title_style))
+    elements.append(Paragraph(f"Relatório de Gastos — {month_name} {now.year}", title_style))
     elements.append(Paragraph("Rafa &amp; Renata", subtitle_style))
-    # Table data
-    table_data = [["Categoria", "Gasto (€)", "Meta (€)", "Saldo (€)", "% Meta"]]
-    total_gasto, total_meta = 0.0, 0.0
     sorted_cats = sorted(insights, key=lambda x: x["gasto"], reverse=True)
+    # ── Pie chart: distribuição de gastos por categoria ──
+    chart_cats = [c for c in sorted_cats if c["gasto"] > 0]
+    PIE_PALETTE = [
+        "#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B2",
+        "#937860", "#DA8BC3", "#8C8C8C", "#CCB974", "#64B5CD", "#A0522D", "#4C4C4C",
+    ]
+    if chart_cats:
+        drawing = Drawing(400, 210)
+        pie = Pie()
+        pie.x = 110
+        pie.y = 15
+        pie.width = 170
+        pie.height = 170
+        pie.data = [c["gasto"] for c in chart_cats]
+        pie.labels = [
+            f"{c['categoria']} ({c['pct']:.0f}%)" if c["meta"] > 0
+            else c["categoria"]
+            for c in chart_cats
+        ]
+        pie.simpleLabels = 0
+        pie.sideLabels = 1
+        pie.slices.strokeWidth = 0.5
+        pie.slices.strokeColor = colors.white
+        for i in range(len(pie.data)):
+            pie.slices[i].fillColor = colors.HexColor(PIE_PALETTE[i % len(PIE_PALETTE)])
+        drawing.add(pie)
+        elements.append(drawing)
+        elements.append(Spacer(1, 10))
+    # Table data (com cor por linha conforme % da meta)
+    table_data = [["Categoria", "Gasto (€)", "Meta (€)", "Saldo (€)", "% Meta"]]
+    row_colors = []
+    total_gasto, total_meta = 0.0, 0.0
     for cat in sorted_cats:
         if cat["meta"] == 0 and cat["gasto"] == 0:
             continue
@@ -524,10 +572,18 @@ def generate_monthly_pdf(insights: list[dict], savings: float) -> str:
         if cat["meta"] > 0:
             total_gasto += cat["gasto"]
             total_meta += cat["meta"]
+            if cat["pct"] >= 100:
+                row_colors.append(colors.HexColor("#f8d7da"))   # vermelho claro
+            elif cat["pct"] >= 75:
+                row_colors.append(colors.HexColor("#fff3cd"))   # amarelo claro
+            else:
+                row_colors.append(colors.HexColor("#d4edda"))   # verde claro
+        else:
+            row_colors.append(colors.white)
     table_data.append(["TOTAL", f"{total_gasto:.2f}", f"{total_meta:.2f}", f"{total_meta-total_gasto:.2f}",
                         f"{(total_gasto/total_meta*100) if total_meta else 0:.0f}%"])
     table = Table(table_data, colWidths=[5*cm, 3*cm, 3*cm, 3*cm, 2.5*cm])
-    table.setStyle(TableStyle([
+    table_style_cmds = [
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2d2d2d")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
@@ -535,21 +591,23 @@ def generate_monthly_pdf(insights: list[dict], savings: float) -> str:
         ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#e8e8e8")),
         ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
         ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -2), [colors.white, colors.HexColor("#f5f5f5")]),
         ("FONTSIZE", (0, 0), (-1, -1), 10),
         ("TOPPADDING", (0, 0), (-1, -1), 6),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-    ]))
+    ]
+    for i, row_color in enumerate(row_colors):
+        table_style_cmds.append(("BACKGROUND", (0, i + 1), (-1, i + 1), row_color))
+    table.setStyle(TableStyle(table_style_cmds))
     elements.append(table)
     elements.append(Spacer(1, 20))
     savings_style = ParagraphStyle("Savings", parent=styles["Normal"], fontSize=13, textColor=colors.HexColor("#1a7a3c"))
-    elements.append(Paragraph(f"🐷 Fundo Poupança (acumulado): € {savings:.2f}", savings_style))
+    elements.append(Paragraph(f"Fundo Poupança (acumulado): € {savings:.2f}", savings_style))
     over = [c for c in insights if c["pct"] >= 100 and c["meta"] > 0]
     if over:
         elements.append(Spacer(1, 10))
         alert_style = ParagraphStyle("Alert", parent=styles["Normal"], fontSize=11, textColor=colors.HexColor("#c0392b"))
         names = ", ".join([c["categoria"] for c in over])
-        elements.append(Paragraph(f"🔴 Categorias que estouraram a meta: {names}", alert_style))
+        elements.append(Paragraph(f"Categorias que estouraram a meta: {names}", alert_style))
     elements.append(Spacer(1, 30))
     footer_style = ParagraphStyle("Footer", parent=styles["Normal"], fontSize=8, textColor=colors.grey, alignment=TA_CENTER)
     elements.append(Paragraph(f"Gerado automaticamente em {now.strftime('%d/%m/%Y %H:%M')} (Amsterdam)", footer_style))
@@ -629,7 +687,7 @@ def build_preview(expense: dict) -> str:
         lines.append(f"🐷 {action} Poupança")
         lines.append(f"💶 € {abs(valor):.2f}  ({expense['pago_com']})")
     else:
-        lines.append(f"📂 {expense['categoria']}")
+        lines.append(f"{cat_emoji(expense['categoria'])} {expense['categoria']}")
         lines.append(f"📝 {expense.get('descricao', '–')}")
         lines.append(f"💶 € {valor:.2f}  ({expense['pago_com']})")
     if expense.get("observacao"):
@@ -828,7 +886,7 @@ async def categorias(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = []
     row = []
     for i, cat in enumerate(CATEGORIES):
-        row.append(InlineKeyboardButton(cat, callback_data=f"catview_{cat}"))
+        row.append(InlineKeyboardButton(f"{cat_emoji(cat)} {cat}", callback_data=f"catview_{cat}"))
         if len(row) == 2:
             keyboard.append(row)
             row = []
@@ -850,9 +908,9 @@ async def handle_category_callback(update: Update, context: ContextTypes.DEFAULT
         is_savings_cat = (categoria == "Poupança")
         period_label = "Acumulado" if is_savings_cat else month_name
         if not expenses:
-            await query.edit_message_text(f"📂 *{categoria} — {period_label}*\n\nNenhum lançamento encontrado.", parse_mode="Markdown")
+            await query.edit_message_text(f"{cat_emoji(categoria)} *{categoria} — {period_label}*\n\nNenhum lançamento encontrado.", parse_mode="Markdown")
             return
-        lines = [f"📂 *{categoria} — {period_label}*\n"]
+        lines = [f"{cat_emoji(categoria)} *{categoria} — {period_label}*\n"]
         total = 0.0
         for e in expenses:
             val_str = re.sub(r'[€ \t]', '', e["valor_raw"]).replace(".", "").replace(",", ".").strip()
@@ -882,7 +940,7 @@ async def handle_category_back(update: Update, context: ContextTypes.DEFAULT_TYP
     keyboard = []
     row = []
     for cat in CATEGORIES:
-        row.append(InlineKeyboardButton(cat, callback_data=f"catview_{cat}"))
+        row.append(InlineKeyboardButton(f"{cat_emoji(cat)} {cat}", callback_data=f"catview_{cat}"))
         if len(row) == 2:
             keyboard.append(row)
             row = []
@@ -918,13 +976,14 @@ async def metas(update: Update, context: ContextTypes.DEFAULT_TYPE):
         no_meta = [i for i in insights if i["meta"] == 0 and i["gasto"] > 0]
         total_meta = 0.0
         for cat in sorted_cats:
-            lines.append(f"• *{cat['categoria']}:* €{cat['meta']:.2f}")
+            lines.append(f"{cat_emoji(cat['categoria'])} *{cat['categoria']}*  —  €{cat['gasto']:.2f} / €{cat['meta']:.2f}")
+            lines.append(f"`{progress_bar(cat['pct'])}`")
             total_meta += cat["meta"]
         if no_meta:
             lines.append("")
             lines.append("_Sem meta definida:_")
             for cat in no_meta:
-                lines.append(f"• {cat['categoria']}")
+                lines.append(f"{cat_emoji(cat['categoria'])} {cat['categoria']}  —  €{cat['gasto']:.2f}")
         lines.append("")
         lines.append(f"💰 *Total orçamento: €{total_meta:.2f}*")
         lines.append("")
