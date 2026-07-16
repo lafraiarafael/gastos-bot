@@ -81,7 +81,7 @@ PENDING_META_EDITS = {}
 CATEGORIES = [
     "Alimentação", "Transporte", "Moradia", "Utilidades",
     "Saúde", "Lazer", "Educação", "Roupas",
-    "Farmácia", "Impostos", "Outros", "Poupança"
+    "Farmácia", "Pets", "Impostos", "Outros", "Poupança"
 ]
 # ─── Emoji fixo por categoria (facilita escanear visualmente) ───────────────
 CATEGORY_EMOJIS = {
@@ -94,6 +94,7 @@ CATEGORY_EMOJIS = {
     "Educação": "📚",
     "Roupas": "👕",
     "Farmácia": "💊",
+    "Pets": "🐾",
     "Impostos": "🧾",
     "Outros": "📦",
     "Poupança": "🐷",
