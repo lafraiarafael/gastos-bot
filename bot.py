@@ -5,6 +5,7 @@ import tempfile
 import re
 import asyncio
 import unicodedata
+import calendar
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -365,6 +366,63 @@ def get_available_months() -> list[dict]:
         label = dt.strftime("%B %Y").capitalize()
         result.append({"year": year, "month": month, "label": label})
     return result
+# ─── Today's entries + days since the last entry (for the daily nudge) ──────
+@with_retry(max_attempts=3, delay=2)
+def get_today_summary() -> dict:
+    """Returns {entries: [...], total: float} for today's date (Amsterdam),
+    excluding Poupança (savings deposits aren't 'expenses' for this check)."""
+    sh = get_spreadsheet()
+    ws = sh.worksheet("Lançamentos")
+    all_rows = ws.get_all_values()
+    today_str = datetime.now(AMSTERDAM_TZ).strftime("%d/%m/%y")
+    entries = []
+    total = 0.0
+    for row in all_rows[2:]:
+        if len(row) < 6 or row[0].strip() != today_str:
+            continue
+        cat = row[3].strip() if len(row) > 3 else ""
+        val_str = row[5].strip() if len(row) > 5 else ""
+        if not cat or not val_str:
+            continue
+        try:
+            valor = float(re.sub(r'[€ ]', '', val_str).replace(".", "").replace(",", "."))
+        except ValueError:
+            continue
+        if cat == "Poupança":
+            continue
+        entries.append({"quem_pagou": row[2], "categoria": cat, "descricao": row[4], "valor": valor})
+        total += valor
+    return {"entries": entries, "total": total}
+@with_retry(max_attempts=3, delay=2)
+def get_days_since_last_entry() -> int | None:
+    """Returns how many days ago the most recent Lançamentos row was dated,
+    or None if the sheet has no valid dated rows at all."""
+    sh = get_spreadsheet()
+    ws = sh.worksheet("Lançamentos")
+    all_rows = ws.get_all_values()
+    today = datetime.now(AMSTERDAM_TZ).date()
+    latest = None
+    for row in all_rows[2:]:
+        date_str = row[0].strip() if row else ""
+        if not date_str:
+            continue
+        try:
+            parts = date_str.split("/")
+            if len(parts) != 3:
+                continue
+            day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
+            year = 2000 + year if year < 100 else year
+            if year < 2020:
+                continue
+            from datetime import date as date_cls
+            d = date_cls(year, month, day)
+        except Exception:
+            continue
+        if latest is None or d > latest:
+            latest = d
+    if latest is None:
+        return None
+    return (today - latest).days
 # ─── Summarize expenses for a specific month ──────────────────────────────────
 @with_retry(max_attempts=3, delay=2)
 def get_month_summary(year: int, month: int) -> dict:
@@ -423,6 +481,56 @@ def get_month_summary(year: int, month: int) -> dict:
         pct = (gasto / meta * 100) if meta > 0 else 0.0
         insights.append({"categoria": cat, "meta": meta, "gasto": gasto, "saldo": saldo, "pct": pct})
     return {"insights": insights, "savings": savings}
+# ─── Archive a finished month's Lançamentos rows ─────────────────────────────
+def get_lancamentos_arquivo_ws():
+    """Returns the Lançamentos_Arquivo worksheet, creating it (with the same
+    header as Lançamentos) if it doesn't exist yet."""
+    sh = get_spreadsheet()
+    try:
+        return sh.worksheet("Lançamentos_Arquivo")
+    except gspread.WorksheetNotFound:
+        ws_live = sh.worksheet("Lançamentos")
+        header = ws_live.get_all_values()[:2]
+        ws = sh.add_worksheet(title="Lançamentos_Arquivo", rows=2000, cols=8)
+        ws.update("A1", header, value_input_option='USER_ENTERED')
+        return ws
+@with_retry(max_attempts=3, delay=2)
+def archive_month_lancamentos(year: int, month: int) -> int:
+    """Moves every Lançamentos row dated in the given year/month into
+    Lançamentos_Arquivo, then rewrites Lançamentos keeping only the header
+    and whatever rows belong to other months. Run once at the end of each
+    month so the live sheet doesn't grow forever — /meses and /relatorio
+    keep working for archived months because they only need the data to be
+    *somewhere* in the spreadsheet, not specifically in Lançamentos.
+    Returns the number of rows archived."""
+    sh = get_spreadsheet()
+    ws = sh.worksheet("Lançamentos")
+    all_rows = ws.get_all_values()
+    header = all_rows[:2]
+    to_archive = []
+    to_keep = []
+    for row in all_rows[2:]:
+        date_str = row[0].strip() if row else ""
+        matched = False
+        if date_str:
+            try:
+                parts = date_str.split("/")
+                if len(parts) == 3:
+                    r_month, r_year = int(parts[1]), int(parts[2])
+                    r_year = 2000 + r_year if r_year < 100 else r_year
+                    if r_year == year and r_month == month:
+                        matched = True
+            except Exception:
+                pass
+        (to_archive if matched else to_keep).append(row)
+    if not to_archive:
+        return 0
+    ws_arq = get_lancamentos_arquivo_ws()
+    ws_arq.append_rows(to_archive, value_input_option='USER_ENTERED')
+    ws.clear()
+    ws.update("A1", header + to_keep, value_input_option='USER_ENTERED')
+    logger.info(f"Arquivadas {len(to_archive)} linhas de {year}-{month:02d}")
+    return len(to_archive)
 # ─── Delete a specific row (clear its contents) ──────────────────────────────
 @with_retry(max_attempts=3, delay=2)
 def delete_lancamento_row(row_number: int):
@@ -581,6 +689,22 @@ def compute_trend_line(current_total: float, year: int, month: int) -> str:
     arrow = "📈" if delta_pct > 0 else "📉"
     direction = "a mais" if delta_pct > 0 else "a menos"
     return f"{arrow} {abs(delta_pct):.0f}% {direction} que o mês passado"
+# ─── Pace projection: no ritmo atual, quanto vai fechar o mês ───────────────
+def pace_projection_line(total_gasto: float, total_meta: float, year: int, month: int) -> str:
+    """Projects the month-end total from the current daily average and
+    compares it against the sum of all category goals. Only meaningful
+    from the 3rd day of the month onward (too noisy before that) and only
+    when there's a combined goal to compare against."""
+    now = datetime.now(AMSTERDAM_TZ)
+    is_current_month = (year == now.year and month == now.month)
+    dias_passados = now.day if is_current_month else calendar.monthrange(year, month)[1]
+    if not is_current_month or dias_passados < 3 or total_meta <= 0:
+        return ""
+    dias_no_mes = calendar.monthrange(year, month)[1]
+    projecao = total_gasto / dias_passados * dias_no_mes
+    pct = projecao / total_meta * 100
+    emoji = "🔴" if pct >= 100 else "🟡" if pct >= 90 else "🟢"
+    return f"{emoji} No ritmo atual, o mês fecha em €{projecao:.2f} ({pct:.0f}% da meta total)"
 # ─── Build confirmation (category only) ──────────────────────────────────────
 def build_confirmation(expense: dict, insights: list[dict], savings: float) -> str:
     month_name = datetime.now(AMSTERDAM_TZ).strftime("%B").capitalize()
@@ -620,7 +744,7 @@ def build_confirmation(expense: dict, insights: list[dict], savings: float) -> s
     return "\n".join(lines)
 # ─── Build full summary ───────────────────────────────────────────────────────
 SEPARATOR = "─────────────"
-def build_full_summary(insights: list[dict], savings: float, title: str = None, trend_line: str = "") -> str:
+def build_full_summary(insights: list[dict], savings: float, title: str = None, trend_line: str = "", pace_line: str = "") -> str:
     month_name = datetime.now(AMSTERDAM_TZ).strftime("%B").capitalize()
     if not title:
         title = f"📊 *Resumo Mensal — {month_name}*"
@@ -651,6 +775,8 @@ def build_full_summary(insights: list[dict], savings: float, title: str = None, 
     sem_meta = total_gasto_geral - total_gasto
     if sem_meta > 0:
         lines.append(f"_+ €{sem_meta:.2f} em categorias sem meta_")
+    if pace_line:
+        lines.append(pace_line)
     # Savings — separate, never mixed with expenses
     lines.append("")
     lines.append(f"🐷 *Fundo Poupança (acumulado): €{savings:.2f}*")
@@ -756,9 +882,15 @@ async def send_summary_with_chart(bot, chat_id, insights: list[dict], savings: f
                 await bot.send_photo(chat_id=chat_id, photo=f)
     except Exception as e:
         logger.warning(f"Chart preview skipped: {e}", exc_info=True)
+    # All callers of send_summary_with_chart pass CURRENT-month insights
+    # (from get_category_insights), so it's safe to project pace against today.
+    now = datetime.now(AMSTERDAM_TZ)
+    total_gasto = sum(c["gasto"] for c in insights if c["meta"] > 0)
+    total_meta = sum(c["meta"] for c in insights if c["meta"] > 0)
+    pace_line = pace_projection_line(total_gasto, total_meta, now.year, now.month)
     await bot.send_message(
         chat_id=chat_id,
-        text=build_full_summary(insights, savings, title, trend_line),
+        text=build_full_summary(insights, savings, title, trend_line, pace_line),
         parse_mode="Markdown"
     )
 # ─── Generate monthly PDF report ─────────────────────────────────────────────
@@ -865,6 +997,27 @@ async def send_weekly_summary(context) -> None:
         await send_summary_with_chart(context.bot, chat_id, insights, savings, title=title, trend_line=trend)
     except Exception as e:
         logger.error(f"Weekly summary error: {e}", exc_info=True)
+# ─── Daily check: recap what was logged today, or nudge if nothing was ──────
+async def send_daily_check(context) -> None:
+    chat_id = context.job.data
+    try:
+        today = await asyncio.to_thread(get_today_summary)
+        if today["entries"]:
+            lines = [f"🌙 *Fechamento do dia — €{today['total']:.2f}*\n"]
+            for e in today["entries"]:
+                lines.append(f"• {person_emoji(e['quem_pagou'])} {cat_emoji(e['categoria'])} {e['categoria']} — {e['descricao'] or '–'} — €{e['valor']:.2f}")
+            await context.bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode="Markdown")
+            return
+        gap = await asyncio.to_thread(get_days_since_last_entry)
+        if gap is None or gap == 0:
+            return
+        if gap >= 3:
+            msg = f"👀 Já fazem {gap} dias sem nenhum lançamento. Tá tudo bem? Se gastaram algo nesse tempo, vale registrar antes de esquecer."
+        else:
+            msg = "🌙 Ninguém lançou nada hoje. Se tiveram algum gasto, manda um áudio ou texto pra registrar!"
+        await context.bot.send_message(chat_id=chat_id, text=msg)
+    except Exception as e:
+        logger.error(f"Daily check error: {e}", exc_info=True)
 # ─── Handle delete request (find candidates + ask confirmation) ─────────────
 async def handle_delete_request(update: Update, context: ContextTypes.DEFAULT_TYPE, query_text: str, sender: str):
     await update.message.reply_text("🔍 Procurando o lançamento...")
@@ -1136,6 +1289,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name=monthly_job_name,
         data=chat_id
     )
+    # Daily check at night: recap today's entries, or nudge if nothing was logged
+    daily_job_name = f"dailycheck_{chat_id}"
+    for job in context.job_queue.get_jobs_by_name(daily_job_name):
+        job.schedule_removal()
+    context.job_queue.run_daily(
+        send_daily_check,
+        time=datetime.now(AMSTERDAM_TZ).replace(hour=21, minute=30, second=0, microsecond=0).timetz(),
+        name=daily_job_name,
+        data=chat_id
+    )
     await update.message.reply_text(
         "👋 *Bot de Gastos — Rafa & Renata* ativo!\n\n"
         "🎙️ Mande um *áudio* com o gasto:\n"
@@ -1158,7 +1321,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/comandos`\n\n"
         "✅ Todo lançamento pede confirmação antes de salvar!\n\n"
         "🗓️ Toda segunda-feira às 8h: resumo automático\n"
-        "🗓️ Todo fim de mês às 20h: relatório PDF automático",
+        "🗓️ Todo fim de mês às 20h: relatório PDF automático\n"
+        "🌙 Toda noite às 21h30: fechamento do dia (ou um toque se ninguém lançou nada)",
         parse_mode="Markdown"
     )
 # ─── /comandos — explica os comandos e como o bot funciona ──────────────────
@@ -1191,7 +1355,8 @@ async def comandos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✅ Todo lançamento pede confirmação antes de salvar\n"
         "🟡 Alerta automático quando uma categoria passa de 90% da meta\n"
         "🗓️ Toda segunda-feira às 8h: resumo semanal automático\n"
-        "🗓️ Todo fim de mês às 20h: relatório PDF automático\n"
+        "🗓️ Todo fim de mês às 20h: relatório PDF automático (e os lançamentos do mês são arquivados)\n"
+        "🌙 Toda noite às 21h30: fechamento do dia, ou um toque se ninguém lançou nada\n"
         "📌 As metas de cada mês ficam registradas — mudar a meta hoje não altera relatórios de meses já passados"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
@@ -1521,6 +1686,11 @@ async def check_last_day_of_month(context) -> None:
     from datetime import timedelta
     if (tomorrow + timedelta(days=1)).month != now.month:
         await send_monthly_pdf(context)
+        try:
+            archived = await asyncio.to_thread(archive_month_lancamentos, now.year, now.month)
+            logger.info(f"Arquivamento de fim de mês: {archived} linhas movidas")
+        except Exception as e:
+            logger.error(f"Month-end archive error: {e}", exc_info=True)
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
     token = os.environ["TELEGRAM_BOT_TOKEN"]
