@@ -80,7 +80,7 @@ def store_pending(expense: dict) -> str:
 # In-memory state for "editar meta" flow (keyed by chat_id → categoria aguardando valor)
 PENDING_META_EDITS = {}
 CATEGORIES = [
-    "Alimentação", "Transporte", "Moradia", "Utilidades",
+    "Alimentação", "Transporte", "Moradia", "Utilidades", "Assinaturas",
     "Saúde", "Lazer", "Educação", "Roupas",
     "Farmácia", "Pets", "Impostos", "Outros", "Poupança"
 ]
@@ -90,6 +90,7 @@ CATEGORY_EMOJIS = {
     "Transporte": "🚗",
     "Moradia": "🏠",
     "Utilidades": "💡",
+    "Assinaturas": "🔁",
     "Saúde": "🏥",
     "Lazer": "🎉",
     "Educação": "📚",
@@ -165,6 +166,7 @@ Categorias válidas: {cats}
 Regras:
 - Se mencionar poupança, guardar, economizar, reservar, depositar → categoria = "Poupança", valor POSITIVO
 - Se mencionar retirar, tirar, sacar, usar da poupança, pegar da poupança → categoria = "Poupança", valor NEGATIVO (ex: -5.00)
+- "Assinaturas" é só para serviços recorrentes de streaming/software (Netflix, Disney+, Spotify, Microsoft, iCloud, apps). Conta de telefone/internet/água/luz continua em "Utilidades".
 - quem_pagou: use "{sender}" se não mencionado
 - pago_com: "Débito" se não mencionado
 - valor: número puro sem símbolo (ex: 32.50 ou -5.00 para retiradas da poupança)
